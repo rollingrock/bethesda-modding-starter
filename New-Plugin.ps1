@@ -7,8 +7,9 @@
     rollingrock's mods (CMake + vcpkg + CommonLib submodule).
 
     Games:
-      F4VR / F4  -> vendored templates/f4sevr-plugin (CommonLibF4 is NG-style: the same
-                    template builds for flat and VR; the preset defines FALLOUTVR)
+      F4VR / F4  -> vendored templates/f4sevr-plugin (CommonLibF4 is NG-style: one template
+                    builds both. vs2022-windows-vcpkg-vr sets BUILD_FALLOUTVR=ON -> defines
+                    FALLOUTVR, builds into buildvr/; vs2022-windows-vcpkg sets it OFF -> build/)
       SF         -> clones rollingrock/sfse-template (raw SFSE hello-world, CMake)
       SkyrimNG   -> not scaffolded here; prints pointers (most Skyrim devs already have a
                     CommonLibSSE-NG flow; see docs/GAME_MATRIX.md)
