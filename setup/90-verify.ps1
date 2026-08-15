@@ -29,7 +29,12 @@ $vsVersions = @(if (Test-Path $vswhere) { & $vswhere -products '*' -requires Mic
 $vsOk = [bool]($vsVersions | Where-Object { [int]($_ -split '\.')[0] -ge 17 })
 $vsDetail = $vsVersions -join ', '
 if ($vsOk -and -not ($vsVersions | Where-Object { $_ -like '17.*' })) {
-    $vsDetail += ' (no 17.x: templates use the "Visual Studio 17 2022" generator — adjust the preset generator)'
+    # Do NOT suggest just retargeting the generator here: configure then succeeds and the
+    # build dies deep inside CommonLibF4 instead. Under C++23's P2266 a returned local is an
+    # rvalue, so `hkVector4f& GetNormalized()` in RE/Havok/hkVector4.h fails with C2440 on
+    # MSVC 14.5x. VS2022 + v143 is the supported toolchain until that is fixed upstream.
+    $vsDetail += ' (no 17.x: VS2022 + v143 is required — CommonLibF4 does not compile on MSVC 14.5x)'
+    $vsOk = $false
 }
 Check 'toolchain' 'VS C++ workload (17+)' $vsOk $vsDetail
 

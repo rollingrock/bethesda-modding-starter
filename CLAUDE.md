@@ -56,7 +56,18 @@ cmake --build buildvr --config Release
 ```
 
 First configure restores ~13 vcpkg ports and compiles CommonLibF4 — several minutes; that is
-normal. **Gate:** `buildvr/Release/<name>.dll` exists. This gate proves VS2022+C++23, CMake,
+normal. **Gate:** `buildvr/Release/<name>.dll` exists.
+
+**Toolchain trap — VS2022 (v143) is required; VS2026 does not work.** `00-prereqs.ps1`
+installs VS2022 for this reason. If the machine has only Visual Studio 18 / 2026 (MSVC
+14.5x), configure fails with `could not find any instance of Visual Studio` because the
+presets pin the `Visual Studio 17 2022` generator. Do **not** "fix" that by retargeting the
+generator: configure then succeeds and the build dies deep inside CommonLibF4 with ~14
+identical `C2440` errors at `RE/Havok/hkVector4.h`. The cause is upstream, not your project —
+`hkVector4f& GetNormalized() { hkVector4f norm = *this; ...; return norm; }` returns a
+reference to a local, and under C++23's P2266 a returned local is an rvalue, so it no longer
+binds to an lvalue reference. (It was always a dangling reference; MSVC 14.4x just accepted
+it.) Install VS2022 alongside whatever else is present and build with that. This gate proves VS2022+C++23, CMake,
 vcpkg, git submodules and the whole chain at once — everything after it is additive.
 
 To test in game: the DLL+PDB go in the mod's `F4SE/Plugins/` (automatic with the `vr-mo2`
