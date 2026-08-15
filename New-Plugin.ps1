@@ -51,6 +51,27 @@ function Invoke-Git {
     if ($LASTEXITCODE -ne 0) { throw "git $($GitArgs -join ' ') failed (exit $LASTEXITCODE)" }
 }
 
+# A freshly installed git has no user.name/user.email, and `git commit` then hard-fails with
+# "Author identity unknown" -- aborting the scaffold on exactly the clean machine this pack
+# targets, and only after the expensive CommonLib submodule clone has already run. Supply a
+# fallback identity for this one commit; a configured identity always wins.
+function Get-CommitIdentityArgs {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $name = & git config --get user.name
+        $haveName = ($LASTEXITCODE -eq 0) -and $name
+        $email = & git config --get user.email
+        $haveEmail = ($LASTEXITCODE -eq 0) -and $email
+    }
+    finally { $ErrorActionPreference = $prev }
+
+    if ($haveName -and $haveEmail) { return @() }
+    Write-Host 'git has no user.name/user.email set; using a scaffold identity for the initial commit.'
+    Write-Host '  set yours with: git config --global user.email "you@example.com"'
+    return @('-c', 'user.name=bethesda-modding-starter', '-c', 'user.email=scaffold@localhost')
+}
+
 if (Test-Path $target) { throw "Target already exists: $target" }
 if ($Game -eq 'SkyrimNG') {
     Write-Host 'Skyrim scaffolding is intentionally not duplicated here.'
@@ -115,7 +136,8 @@ if ($Game -in 'F4VR', 'F4') {
         Copy-Item (Join-Path $packRoot 'mcp\mcp.template.json') '.mcp.json'
 
         Invoke-Git add -A
-        Invoke-Git commit -m "chore: scaffold $Name from bethesda-modding-starter" | Out-Null
+        $ident = Get-CommitIdentityArgs
+        Invoke-Git @ident commit -m "chore: scaffold $Name from bethesda-modding-starter" | Out-Null
     }
     finally { Pop-Location }
 
@@ -154,7 +176,8 @@ elseif ($Game -eq 'SF') {
         Invoke-Git init --initial-branch=main | Out-Null
         Copy-Item (Join-Path $packRoot 'mcp\mcp.template.json') '.mcp.json'
         Invoke-Git add -A
-        Invoke-Git commit -m "chore: scaffold $Name from sfse-template" | Out-Null
+        $ident = Get-CommitIdentityArgs
+        Invoke-Git @ident commit -m "chore: scaffold $Name from sfse-template" | Out-Null
     }
     finally { Pop-Location }
 
