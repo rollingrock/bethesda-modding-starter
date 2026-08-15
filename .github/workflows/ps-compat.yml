@@ -1,0 +1,91 @@
+name: PowerShell compatibility
+
+# A fresh Windows machine (and Claude Code's shell on Windows) runs Windows
+# PowerShell 5.1, not pwsh 7 -- and 00-prereqs.ps1 is what *installs* pwsh 7.
+# So every script here must parse under 5.1 or the whole runbook is unreachable.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  parse-5-1:
+    name: Parse under Windows PowerShell 5.1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report host version
+        shell: powershell
+        run: $PSVersionTable.PSVersion.ToString()
+
+      - name: Every .ps1 must parse under 5.1
+        shell: powershell
+        run: |
+          $failed = @()
+          Get-ChildItem -Path . -Filter *.ps1 -Recurse -File | ForEach-Object {
+              $errs = $null
+              $null = [System.Management.Automation.Language.Parser]::ParseFile(
+                  $_.FullName, [ref]$null, [ref]$errs)
+              if ($errs.Count) {
+                  $failed += $_.FullName
+                  Write-Host "FAIL $($_.FullName)"
+                  $errs | Select-Object -First 5 | ForEach-Object {
+                      Write-Host "    line $($_.Extent.StartLineNumber): $($_.Message)"
+                  }
+              }
+              else { Write-Host "ok   $($_.Name)" }
+          }
+          if ($failed.Count) {
+              Write-Host ''
+              Write-Host "$($failed.Count) script(s) do not parse under Windows PowerShell 5.1."
+              Write-Host 'Common causes: the ternary (a ? b : c) and null-coalescing (??) operators'
+              Write-Host 'are pwsh 7 only, and a non-ASCII char in a BOM-less file is decoded as'
+              Write-Host 'CP1252 -- an em dash becomes U+201D, which PowerShell treats as a quote.'
+              exit 1
+          }
+
+      - name: Non-ASCII .ps1 files must carry a UTF-8 BOM
+        shell: powershell
+        run: |
+          $bad = @()
+          Get-ChildItem -Path . -Filter *.ps1 -Recurse -File | ForEach-Object {
+              $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+              $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
+                        $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+              $nonAscii = @($bytes | Where-Object { $_ -gt 127 }).Count
+              if ($nonAscii -gt 0 -and -not $hasBom) {
+                  $bad += $_.FullName
+                  Write-Host "FAIL $($_.FullName) ($nonAscii non-ASCII bytes, no BOM)"
+              }
+          }
+          if ($bad.Count) {
+              Write-Host ''
+              Write-Host 'Windows PowerShell 5.1 reads BOM-less .ps1 as the ANSI codepage.'
+              Write-Host 'Save these as UTF-8 with BOM (pwsh 7 reads that fine too).'
+              exit 1
+          }
+          Write-Host 'All .ps1 files are ASCII-only or carry a UTF-8 BOM.'
+
+      # Smoke test: these must EXECUTE, not merely parse. A bare runner is missing most
+      # components, so a non-zero exit is expected and fine -- we only fail on a thrown
+      # error (a real scripting bug). winget is absent from some runner images, which
+      # 00-prereqs.ps1 correctly throws on; that one is tolerated explicitly.
+      - name: Setup scripts run their -CheckOnly path
+        shell: powershell
+        run: |
+          $hardFail = $false
+          function Smoke([string]$label, [scriptblock]$body, [switch]$AllowThrow) {
+              Write-Host "=== $label ==="
+              try { & $body; Write-Host "$label exit=$LASTEXITCODE (non-zero is expected on CI)" }
+              catch {
+                  if ($AllowThrow) { Write-Host "$label threw (tolerated): $_" }
+                  else { Write-Host "$label THREW: $_"; $script:hardFail = $true }
+              }
+          }
+          Smoke '00-prereqs -CheckOnly' { .\setup\00-prereqs.ps1 -CheckOnly } -AllowThrow
+          Smoke '10-vcpkg -CheckOnly'   { .\setup\10-vcpkg.ps1 -CheckOnly -VcpkgDir "$env:RUNNER_TEMP\vcpkg" }
+          Smoke '90-verify'             { .\setup\90-verify.ps1 }
+          if ($hardFail) { Write-Host ''; Write-Host 'A setup script threw.'; exit 1 }
+          exit 0

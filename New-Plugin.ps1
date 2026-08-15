@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Scaffold a new script-extender plugin repo from the starter pack's templates.
 
@@ -35,6 +35,20 @@ param(
 $ErrorActionPreference = 'Stop'
 $packRoot = $PSScriptRoot
 $target = Join-Path $Dir $Name
+
+# git writes progress AND benign warnings ("LF will be replaced by CRLF") to stderr. Under
+# Windows PowerShell 5.1 a native command's stderr becomes an ErrorRecord whenever the caller
+# merges streams (2>&1 — which some agent harnesses and CI wrappers do by default), and with
+# $ErrorActionPreference='Stop' that aborts the scaffold half-built. The exit code is the only
+# trustworthy signal, so check it explicitly.
+function Invoke-Git {
+    param([Parameter(ValueFromRemainingArguments)][string[]]$GitArgs)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & git @GitArgs }
+    finally { $ErrorActionPreference = $prev }
+    if ($LASTEXITCODE -ne 0) { throw "git $($GitArgs -join ' ') failed (exit $LASTEXITCODE)" }
+}
 
 if (Test-Path $target) { throw "Target already exists: $target" }
 if ($Game -eq 'SkyrimNG') {
@@ -75,9 +89,9 @@ if ($Game -in 'F4VR', 'F4') {
 
     Push-Location $target
     try {
-        git init --initial-branch=main | Out-Null
-        git submodule add https://github.com/rollingrock/CommonLibF4.git external/CommonLibF4
-        git submodule update --init --recursive
+        Invoke-Git init --initial-branch=main | Out-Null
+        Invoke-Git submodule add https://github.com/rollingrock/CommonLibF4.git external/CommonLibF4
+        Invoke-Git submodule update --init --recursive
 
         if ($Mo2Path) {
             $mo2 = ($Mo2Path -replace '\\', '/').TrimEnd('/')
@@ -99,8 +113,8 @@ if ($Game -in 'F4VR', 'F4') {
         # Per-project MCP config so Claude Code sessions in the new repo get Ghidra + x64dbg.
         Copy-Item (Join-Path $packRoot 'mcp\mcp.template.json') '.mcp.json'
 
-        git add -A
-        git commit -m "chore: scaffold $Name from bethesda-modding-starter" | Out-Null
+        Invoke-Git add -A
+        Invoke-Git commit -m "chore: scaffold $Name from bethesda-modding-starter" | Out-Null
     }
     finally { Pop-Location }
 
@@ -113,14 +127,16 @@ if ($Game -in 'F4VR', 'F4') {
     Write-Host '  cmake --build buildvr --config Release'
     if ($Game -eq 'F4') {
         Write-Host ''
-        Write-Host 'NOTE (flat F4): the vs2022 preset defines FALLOUTVR. For a flat-runtime build,'
-        Write-Host 'configure without the vr preset inheritance or ask your agent to add a flat preset;'
-        Write-Host 'rollingrock/CommonLibF4 itself builds both (NG-style).'
+        Write-Host 'NOTE (flat F4): use the flat preset instead of the VR one above:'
+        Write-Host '  cmake --preset vs2022-windows-vcpkg'
+        Write-Host '  cmake --build build --config Release'
+        Write-Host 'It sets BUILD_FALLOUTVR=OFF (no FALLOUTVR define) and builds into build/ rather'
+        Write-Host 'than buildvr/; rollingrock/CommonLibF4 builds both from one tree (NG-style).'
     }
 }
 elseif ($Game -eq 'SF') {
     Write-Host "Scaffolding $Name from rollingrock/sfse-template ..."
-    git clone --depth 1 https://github.com/rollingrock/sfse-template.git $target
+    Invoke-Git clone --depth 1 https://github.com/rollingrock/sfse-template.git $target
     Remove-Item -Recurse -Force (Join-Path $target '.git')
 
     $files = Get-ChildItem $target -Recurse -File | Where-Object { $_.Extension -in '.txt', '.json', '.cpp', '.h', '.md', '.cmake' }
@@ -134,10 +150,10 @@ elseif ($Game -eq 'SF') {
 
     Push-Location $target
     try {
-        git init --initial-branch=main | Out-Null
+        Invoke-Git init --initial-branch=main | Out-Null
         Copy-Item (Join-Path $packRoot 'mcp\mcp.template.json') '.mcp.json'
-        git add -A
-        git commit -m "chore: scaffold $Name from sfse-template" | Out-Null
+        Invoke-Git add -A
+        Invoke-Git commit -m "chore: scaffold $Name from sfse-template" | Out-Null
     }
     finally { Pop-Location }
 

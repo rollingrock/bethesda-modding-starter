@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Install Ghidra + the GhidraMCP extension + the MCP bridge (bethington/ghidra-mcp).
 

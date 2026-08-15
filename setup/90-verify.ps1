@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Verify the whole environment; optionally prove it by building a scaffolded plugin.
 
@@ -16,16 +16,16 @@ param(
 
 $rows = [System.Collections.Generic.List[object]]::new()
 function Check([string]$area, [string]$name, [bool]$ok, [string]$detail = '') {
-    $rows.Add([pscustomobject]@{ Area = $area; Check = $name; OK = ($ok ? 'PASS' : 'FAIL'); Detail = $detail })
+    $rows.Add([pscustomobject]@{ Area = $area; Check = $name; OK = $(if ($ok) { 'PASS' } else { 'FAIL' }); Detail = $detail })
 }
 
 # toolchain
 foreach ($c in 'git', 'cmake', 'python', 'java', 'mvn', 'node', 'gh') {
     $cmd = Get-Command $c -ErrorAction SilentlyContinue
-    Check 'toolchain' $c ($null -ne $cmd) ($cmd ? $cmd.Source : 'not on PATH')
+    Check 'toolchain' $c ($null -ne $cmd) $(if ($cmd) { $cmd.Source } else { 'not on PATH' })
 }
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$vsVersions = @((Test-Path $vswhere) ? (& $vswhere -products '*' -requires Microsoft.VisualStudio.Workload.NativeDesktop -property installationVersion) : @())
+$vsVersions = @(if (Test-Path $vswhere) { & $vswhere -products '*' -requires Microsoft.VisualStudio.Workload.NativeDesktop -property installationVersion })
 $vsOk = [bool]($vsVersions | Where-Object { [int]($_ -split '\.')[0] -ge 17 })
 $vsDetail = $vsVersions -join ', '
 if ($vsOk -and -not ($vsVersions | Where-Object { $_ -like '17.*' })) {
@@ -45,8 +45,8 @@ foreach ($v in 'VCPKG_ROOT', 'VCPKG_INSTALLATION_ROOT', 'GHIDRA_MCP_ALLOW_SCRIPT
     $val = Get-PersistedEnv $v
     Check 'env' $v ([bool]$val) "$val"
 }
-$vcpkgRoot = [Environment]::GetEnvironmentVariable('VCPKG_ROOT', 'User') ??
-    [Environment]::GetEnvironmentVariable('VCPKG_ROOT', 'Machine')
+$vcpkgRoot = [Environment]::GetEnvironmentVariable('VCPKG_ROOT', 'User')
+if (-not $vcpkgRoot) { $vcpkgRoot = [Environment]::GetEnvironmentVariable('VCPKG_ROOT', 'Machine') }
 if ($vcpkgRoot) { Check 'env' 'vcpkg bootstrapped' (Test-Path (Join-Path $vcpkgRoot 'vcpkg.exe')) }
 
 # repos

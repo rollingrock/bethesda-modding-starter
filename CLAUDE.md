@@ -15,6 +15,14 @@ diverging from the defaults.
 2. Ask which game(s) they target first (F4VR / F4 / Skyrim / Starfield) and whether they use
    MO2 (and its path) — you need this for deploy wiring.
 3. `winget --version` must work. If not, stop and have the user install "App Installer".
+4. Shell: every script here is **Windows PowerShell 5.1**-clean, so you can run them from the
+   stock Windows shell (which is also what Claude Code uses on Windows) — you do not need
+   pwsh 7 first. That constraint is not cosmetic: `00-prereqs.ps1` is what *installs* pwsh 7,
+   so if it needed pwsh 7 the runbook could never start. If you edit a script, keep it 5.1-safe
+   — no `?:` ternary, no `??` — and save it as UTF-8 **with BOM**. Without a BOM, 5.1 decodes
+   the file as CP1252 and an em dash (`—`) becomes `â€”`, whose last character is U+201D, which
+   PowerShell treats as a quote; the file then fails to parse with a misleading error pointing
+   at some unrelated line. CI enforces both rules (`.github/workflows/ps-compat.yml`).
 
 ## Phase 1 — toolchain
 

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Clone + bootstrap vcpkg and set the environment variables the build chain reads.
 
@@ -18,16 +18,28 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# git and bootstrap-vcpkg.bat both write progress to stderr. Under Windows PowerShell 5.1 that
+# becomes an ErrorRecord whenever the caller merges streams (2>&1), which $ErrorActionPreference
+# ='Stop' would turn into a spurious abort. Run natives with 'Continue' and judge them by their
+# exit code, which is the only trustworthy signal.
+function Invoke-Native {
+    param([Parameter(Mandatory)][string]$What, [Parameter(Mandatory)][scriptblock]$Body)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Body } finally { $ErrorActionPreference = $prev }
+    if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
+}
+
 $ok = $true
 if (-not (Test-Path (Join-Path $VcpkgDir '.git'))) {
     if ($CheckOnly) { Write-Host "MISSING: vcpkg clone at $VcpkgDir"; $ok = $false }
     else {
-        git clone https://github.com/microsoft/vcpkg.git $VcpkgDir
+        Invoke-Native 'git clone vcpkg' { git clone https://github.com/microsoft/vcpkg.git $VcpkgDir }
     }
 }
 if ((Test-Path $VcpkgDir) -and -not (Test-Path (Join-Path $VcpkgDir 'vcpkg.exe'))) {
     if ($CheckOnly) { Write-Host 'MISSING: vcpkg.exe (bootstrap not run)'; $ok = $false }
-    else { & (Join-Path $VcpkgDir 'bootstrap-vcpkg.bat') -disableMetrics }
+    else { Invoke-Native 'bootstrap-vcpkg' { & (Join-Path $VcpkgDir 'bootstrap-vcpkg.bat') -disableMetrics } }
 }
 
 if ($NoEnv) {
@@ -37,8 +49,8 @@ if ($NoEnv) {
 
 foreach ($name in 'VCPKG_ROOT', 'VCPKG_INSTALLATION_ROOT') {
     # Accept an existing value at either persisted scope (some machines set these Machine-wide).
-    $current = [Environment]::GetEnvironmentVariable($name, 'User') ??
-        [Environment]::GetEnvironmentVariable($name, 'Machine')
+    $current = [Environment]::GetEnvironmentVariable($name, 'User')
+    if (-not $current) { $current = [Environment]::GetEnvironmentVariable($name, 'Machine') }
     if ($current -ne $VcpkgDir) {
         if ($CheckOnly) { Write-Host "MISSING/WRONG: user env $name (is: '$current', want: '$VcpkgDir')"; $ok = $false }
         else {

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Install (or verify) the base toolchain for Bethesda script-extender plugin dev + RE.
 
@@ -38,7 +38,7 @@ function Ensure-Winget([string]$display, [string]$id, [scriptblock]$check, [stri
     if ($override) { $wingetArgs += @('--override', $override) }
     & winget @wingetArgs
     $ok = ($LASTEXITCODE -eq 0)
-    $results.Add([pscustomobject]@{ Component = $display; Status = ($ok ? 'installed' : 'FAILED'); Action = "winget $id" })
+    $results.Add([pscustomobject]@{ Component = $display; Status = $(if ($ok) { 'installed' } else { 'FAILED' }); Action = "winget $id" })
 }
 
 if (-not (Test-Cmd 'winget')) {

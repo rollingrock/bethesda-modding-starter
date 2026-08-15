@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Install x64dbg + the x64dbg MCP plugin (bromoket/x64dbg_mcp).
 

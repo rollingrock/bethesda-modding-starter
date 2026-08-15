@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Clone the source repos the modding + RE workflow builds on.
 
@@ -57,7 +57,13 @@ foreach ($r in $repos) {
         continue
     }
     Write-Host "cloning $($r.Url) -> $dest"
+    # git reports progress on stderr. Under Windows PowerShell 5.1 that becomes an ErrorRecord
+    # whenever the caller merges streams (2>&1), and $ErrorActionPreference='Stop' would then
+    # abort before the exit-code check below could clean up the partial clone.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     git clone @($r.Args) $r.Url $dest
+    $ErrorActionPreference = $prevEap
     if ($LASTEXITCODE -ne 0) {
         # Remove the partial clone: a half-cloned repo would pass the exists-check on
         # re-run and hide the failure. Keep going — one bad repo must not block the rest.
