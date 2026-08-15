@@ -55,20 +55,46 @@ are one-way and analysis databases for game binaries are hours of work to rebuil
    call sites that access it.
 4. **The bridge's `debugger_*` tools are WinDbg/dbgeng proxies** (a separate server, usually not
    running). For live game debugging use the **`x64dbg` MCP entry** instead.
-5. **Import the address library early** (see `../ghidra-scripts/`) — thousands of free function
-   names make every later decompile readable.
+5. **Build the analysis database with BethesdaGhidraScripts, not by hand** (next section) —
+   types, vtables, signatures and thousands of names make every later decompile readable.
 6. Cross-binary signature matching (e.g. Skyrim ↔ Fallout, flat ↔ VR) = two Ghidra GUIs, one per
    binary, `connect_instance` to switch: `get_function_bytes` on the known side → wildcard the
    rel32 offsets → `search_byte_patterns` on the unknown side → `decompile_function` to confirm
    logic.
 
-## For a new game binary
+## For a new game binary: BethesdaGhidraScripts
 
-1. Create a Ghidra project, import the EXE (with PDB if one exists — VR binaries shipped with
-   partial ones historically; flat binaries rarely).
-2. Run auto-analysis and let it FINISH (hours for a Bethesda binary; interrupting corrupts less
-   than it tempts you to think, but the function list will be incomplete).
-3. Run the RTTI analyzer — Creation Engine binaries are RTTI-rich, and class hierarchies are the
-   fastest map of the engine.
-4. Import the address library names.
-5. Save. Back up the project directory before any mass-modifying script.
+Do NOT build the analysis database by hand.
+[1001Bits/BethesdaGhidraScripts](https://github.com/1001Bits/BethesdaGhidraScripts) (cloned by
+`setup/20-repos.ps1`) automates the whole thing for Skyrim SE/AE/VR, Fallout 4 (OG/NG/AE/VR),
+Starfield and FNV: it clang-parses the CommonLib headers and imports **type definitions, vtable
+layouts, function signatures and address-library names** — for the VR binaries it parses
+CommonLibVR/CommonLibF4VR with the VR defines set, giving true VR struct layouts.
+
+```powershell
+cd C:\repos\BethesdaGhidraScripts
+# drop your game EXE(s) into exes\<game>\<ver>\ (see its README for the exact paths)
+python run.py     # menu: 1 (install prereqs incl. its own pinned Ghidra), 2 (submodules),
+                  #       7 (full rebuild — generates importers + headless imports everything)
+```
+
+Auto-analysis takes hours per Bethesda binary; let it finish. Afterwards:
+
+- Menu **6** opens Ghidra with the enriched project.
+- Menu **9** improves an EXISTING project of yours (exact CommonLib importer → generic
+  RTTI-walk vtable naming → name reconciler) — it only renames `FUN_*` placeholders and
+  leaves hand-typed names alone.
+- Menu **10** exports symbols as JSON / .map / **x64dbg database** / a synthetic **PDB** —
+  feed the x64dbg export to the x64dbg MCP setup so live debugging shows real names.
+
+`setup/30-ghidra.ps1` builds the GhidraMCP extension **against BGS's managed Ghidra**
+(`tools/ghidra` inside the repo) when present, so one Ghidra serves both the pipeline and the
+MCP bridge. Back up the project directory before any mass-modifying script.
+
+**Fork note (2026-08):** `alandtse/BethesdaGhidraScripts` is an actively developed sibling
+fork (rules-format + enrichment refactors); the 1001Bits fork uniquely carries the true-VR
+importers, the option-10 export suite, TTD dispatch xrefs and IDA name-ports. They have
+diverged — the pack defaults to 1001Bits for the VR features; check both before deep work.
+
+The single-file `../ghidra-scripts/ImportAddressLibrary.py` remains as a minimal fallback
+(names only, needs the Jython extension) for when you don't want the full pipeline.

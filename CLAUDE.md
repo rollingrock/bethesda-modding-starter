@@ -56,23 +56,38 @@ preset); copy the TOML from `Data/F4SE/Plugins/` next to it by hand. The game ne
 and the [VR Address Library](https://www.nexusmods.com/fallout4/mods/64879) installed. Check
 `Documents\My Games\Fallout4VR\F4SE\<name>.log` for the load banner.
 
-## Phase 4 — Ghidra + MCP (RE layer)
+## Phase 4 — Ghidra: analysis database + MCP (RE layer)
 
-```powershell
-.\setup\30-ghidra.ps1
-```
+Two halves. First the **enriched analysis database** via BethesdaGhidraScripts (types,
+vtables, signatures, address-library names — automated; this is what makes decompiles
+readable), then the **MCP bridge** so you can drive Ghidra from sessions.
 
-Then the once-per-machine manual part (the script prints it): start Ghidra, confirm the
-GhidraMCP extension is enabled, import the game EXE, run auto-analysis (**hours** — schedule
-it overnight; do not interrupt), then `Tools > GhidraMCP > Start MCP Server`.
+1. Ask the user which game EXE(s) to analyze and stage them:
+   `C:\repos\BethesdaGhidraScripts\exes\<game>\<ver>\<Game>.exe` (paths in its README —
+   the EXEs come from the user's game installs; you cannot download them).
+2. ```powershell
+   cd C:\repos\BethesdaGhidraScripts
+   python run.py    # menu option 1 (prereqs incl. its own pinned Ghidra), then 2, then 7
+   ```
+   Option 7's auto-analysis takes **hours per binary** — schedule it (e.g. overnight) and do
+   not interrupt it. The menu's status panel shows what's detected.
+3. ```powershell
+   .\setup\30-ghidra.ps1   # builds the MCP extension against BGS's managed Ghidra
+   ```
+4. Manual once-per-machine (the script prints it): open Ghidra (BGS menu 6), confirm the
+   GhidraMCP extension is enabled, `Tools > GhidraMCP > Start MCP Server`.
 
 Give the project's Claude sessions access by copying `mcp\mcp.template.json` to the project as
 `.mcp.json` (the scaffolder already does this for new plugins).
 
 **Gate:** with Ghidra running + server started, an MCP session can `list_instances()` →
-`connect_instance(...)` → `decompile_function` on some function. **Read
-`docs/GHIDRA_WORKFLOW.md` before real RE work — especially the connect ritual; skipping it
-makes the toolset look broken or, worse, reads the wrong binary.**
+`connect_instance(...)` → `decompile_function` on a function **and see CommonLib names/types
+in the output** (not just `FUN_*`). **Read `docs/GHIDRA_WORKFLOW.md` before real RE work —
+especially the connect ritual; skipping it makes the toolset look broken or, worse, reads the
+wrong binary.**
+
+Bonus once analysis is done: BGS menu option 10 exports symbols for **x64dbg** (live
+debugging with real names) and can build a synthetic PDB.
 
 ## Phase 5 — x64dbg + MCP (live debugging)
 

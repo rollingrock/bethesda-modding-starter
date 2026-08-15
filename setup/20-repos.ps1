@@ -18,6 +18,16 @@
                          Fallout 4 / FO4VR (F4SE/CMake). See docs/DEVBENCH.md.
       ghidra-mcp         bethington/ghidra-mcp — Ghidra MCP bridge + extension source.
                          Installed by setup/30-ghidra.ps1.
+      BethesdaGhidraScripts
+                         1001Bits/BethesdaGhidraScripts — THE Ghidra enrichment pipeline:
+                         auto-imports CommonLib types, vtable layouts, function signatures
+                         and address-library names for Skyrim SE/AE/VR, Fallout 4 (all
+                         builds + VR), Starfield and FNV; true-VR struct layouts; symbol
+                         export to JSON/.map/x64dbg/synthetic PDB. Manages its own pinned
+                         Ghidra under tools/ghidra. Cloned WITHOUT submodules — its own
+                         menu option 2 restores the reviewed submodule revisions.
+                         (alandtse/BethesdaGhidraScripts is an actively developed sibling
+                         fork; the two have diverged — see docs/GHIDRA_WORKFLOW.md.)
 #>
 [CmdletBinding()]
 param(
@@ -33,6 +43,7 @@ $repos = @(
     @{ Name = 'commonlibsf';  Url = 'https://github.com/libxse/commonlibsf.git';        Args = @('--recurse-submodules') }
     @{ Name = 'devbench';     Url = 'https://github.com/rollingrock/devbench.git';      Args = @('--branch', 'feat/multigame-core', '--recurse-submodules') }
     @{ Name = 'ghidra-mcp';   Url = 'https://github.com/bethington/ghidra-mcp.git';     Args = @() }
+    @{ Name = 'BethesdaGhidraScripts'; Url = 'https://github.com/1001Bits/BethesdaGhidraScripts.git'; Args = @() }
 )
 if (-not $SkipAddressTools) {
     $repos += @{ Name = 'vr_address_tools'; Url = 'https://github.com/alandtse/vr_address_tools.git'; Args = @('--recurse-submodules') }

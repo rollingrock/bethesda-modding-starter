@@ -55,9 +55,12 @@ foreach ($r in 'CommonLibF4', 'commonlibsf', 'devbench', 'ghidra-mcp') {
 }
 Check 'repos' 'vr_address_tools (optional)' (Test-Path (Join-Path $Root 'vr_address_tools\.git'))
 
-# ghidra (a machine may carry several installs; any one with the extension counts)
+# ghidra (a machine may carry several installs; any one with the extension counts).
+# BethesdaGhidraScripts manages its own install under <Root>\BethesdaGhidraScripts\tools\ghidra.
 $ghidras = @(Get-ChildItem $ToolsDir -Directory -Filter 'ghidra_*' -ErrorAction SilentlyContinue)
-Check 'ghidra' 'install' ($ghidras.Count -gt 0) (($ghidras | Select-Object -ExpandProperty Name) -join ', ')
+$bgsGhidra = Join-Path $Root 'BethesdaGhidraScripts\tools\ghidra'
+if (Test-Path (Join-Path $bgsGhidra 'Ghidra\application.properties')) { $ghidras += Get-Item $bgsGhidra }
+Check 'ghidra' 'install' ($ghidras.Count -gt 0) (($ghidras | Select-Object -ExpandProperty FullName) -join ', ')
 Check 'ghidra' 'bridge exe' (Test-Path (Join-Path $Root 'ghidra-mcp\.venv\Scripts\bridge-mcp-ghidra.exe'))
 if ($ghidras.Count) {
     $ext = @(Get-ChildItem (Join-Path $env:APPDATA 'ghidra') -Directory -ErrorAction SilentlyContinue |

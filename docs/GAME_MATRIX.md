@@ -23,3 +23,6 @@ game; the pack's defaults are **bold**.
   submodule / path (`external/CommonLibF4`), not as vcpkg ports. The template handles this.
 - **`vr_address_tools`** (alandtse) also contains Python tooling for porting flat mods to VR
   (offset conversion, struct extraction) — not just the CSVs.
+- **For RE name/type databases, BethesdaGhidraScripts bundles its own address libraries** for
+  every game it supports — including Starfield versionlibs, which `vr_address_tools` lacks.
+  See `GHIDRA_WORKFLOW.md`.
