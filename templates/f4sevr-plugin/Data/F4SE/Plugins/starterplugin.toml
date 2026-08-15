@@ -1,0 +1,8 @@
+# starterplugin configuration.
+# Deploy this file next to the DLL (Data/F4SE/Plugins/ in your mod folder).
+# Missing file or missing keys = plugin uses its built-in defaults.
+
+[starterplugin]
+enableExampleFeature = true
+exampleNumber = 42
+exampleName = "hello"
