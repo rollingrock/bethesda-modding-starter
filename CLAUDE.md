@@ -67,7 +67,14 @@ identical `C2440` errors at `RE/Havok/hkVector4.h`. The cause is upstream, not y
 `hkVector4f& GetNormalized() { hkVector4f norm = *this; ...; return norm; }` returns a
 reference to a local, and under C++23's P2266 a returned local is an rvalue, so it no longer
 binds to an lvalue reference. (It was always a dangling reference; MSVC 14.4x just accepted
-it.) Install VS2022 alongside whatever else is present and build with that. This gate proves VS2022+C++23, CMake,
+it.) Install VS2022 alongside whatever else is present and build with that.
+
+The upstream fix is one line — return by value, `hkVector4f GetNormalized() const` — and it
+is verified: with that change the full chain (CommonLibF4 + plugin) builds clean under VS2026
+/ MSVC 14.51 and produces a valid x64 F4SE plugin. It is the only such site in the tree;
+`Normalize()` just above returns `*this`, a member, and is fine. Once that lands in
+rollingrock/CommonLibF4, the VS2022 pin here (and in `.github/workflows/e2e-build.yml`) can
+be relaxed. This gate proves VS2022+C++23, CMake,
 vcpkg, git submodules and the whole chain at once — everything after it is additive.
 
 To test in game: the DLL+PDB go in the mod's `F4SE/Plugins/` (automatic with the `vr-mo2`
