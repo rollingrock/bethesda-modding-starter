@@ -9,6 +9,9 @@ name: E2E scaffold + build (F4VR)
 # New-Plugin.ps1 has to cope with that on its own. Leaving it unset keeps that guarantee
 # under test. (winget is likewise absent from the runner image, so 00-prereqs.ps1 is skipped
 # and the preinstalled VS2022/CMake/git are used instead.)
+#
+# Failures write the relevant tail into the run summary and upload the vcpkg logs, so a
+# broken run can be diagnosed from the summary alone without pulling raw job logs.
 on:
   push:
     branches: [main]
@@ -28,9 +31,9 @@ jobs:
         shell: powershell
         run: |
           Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
-          # `git config --get` exits 1 when the key is unset -- which is the very state this
-          # step exists to detect. GitHub's powershell shell appends an `exit $LASTEXITCODE`,
-          # so that 1 would fail the step. Capture the codes and exit 0 deliberately.
+          # `git config --get` exits 1 when the key is unset -- the very state this step
+          # exists to detect. GitHub's powershell shell appends an `exit $LASTEXITCODE`, so
+          # that 1 would fail the step. Capture the codes and exit 0 deliberately.
           $name  = & git config --get user.name;  $nameRc  = $LASTEXITCODE
           $email = & git config --get user.email; $emailRc = $LASTEXITCODE
           Write-Host "git user.name  = '$name' (rc=$nameRc)"
@@ -39,6 +42,11 @@ jobs:
               Write-Host '::warning::Runner has a git identity configured; the no-identity path is not being exercised.'
           }
           else { Write-Host 'No git identity set -- New-Plugin.ps1 must handle this itself.' }
+          Write-Host "--- toolchain ---"
+          cmake --version | Select-Object -First 1
+          Write-Host "free space:"
+          Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null } |
+              Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize | Out-String | Write-Host
           exit 0
 
       - name: Cache vcpkg binary archives
@@ -57,9 +65,21 @@ jobs:
           if (-not $vcpkg -or -not (Test-Path $vcpkg)) { $vcpkg = Join-Path $env:RUNNER_TEMP 'vcpkg' }
           Write-Host "Using vcpkg at $vcpkg"
           .\setup\10-vcpkg.ps1 -VcpkgDir $vcpkg -NoEnv
+          # The manifest pins a builtin-baseline, so that commit must exist in this clone.
+          $baseline = (Get-Content templates/f4sevr-plugin/vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          Write-Host "manifest builtin-baseline: $baseline"
+          $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+          & git -C $vcpkg cat-file -e "$baseline^{commit}"
+          $haveBaseline = ($LASTEXITCODE -eq 0)
+          & git -C $vcpkg log --oneline -1 | Write-Host
+          $ErrorActionPreference = $prev
+          Write-Host "baseline present in this vcpkg clone: $haveBaseline"
+          if (-not $haveBaseline) {
+              Write-Host '::warning::vcpkg clone does not contain the manifest baseline; vcpkg will try to fetch it.'
+          }
           # Both names, because CMakeLists.txt reads VCPKG_ROOT and CMakePresets.json reads
           # VCPKG_INSTALLATION_ROOT -- the trap 10-vcpkg.ps1 documents.
-          "VCPKG_ROOT=$vcpkg"             | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_ROOT=$vcpkg"              | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "VCPKG_INSTALLATION_ROOT=$vcpkg" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           # Real failures in 10-vcpkg.ps1 throw (fatal under the shell's EAP=stop); this only
           # stops a leftover native exit code from being read as the step result.
@@ -82,30 +102,94 @@ jobs:
       - name: Configure (vs2022-windows-vcpkg-vr)
         shell: powershell
         run: |
-          cd $env:RUNNER_TEMP\citest
-          cmake --preset vs2022-windows-vcpkg-vr
-          if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
+          # cmake and vcpkg write plenty to stderr; under this shell's EAP=stop a merged
+          # stream would turn the first such line into a terminating error. Judge by rc.
+          $ErrorActionPreference = 'Continue'
+          $logFile = Join-Path $env:RUNNER_TEMP 'configure.log'
+          Set-Location (Join-Path $env:RUNNER_TEMP 'citest')
+          cmake --preset vs2022-windows-vcpkg-vr 2>&1 | Tee-Object -FilePath $logFile
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+              "## Configure failed (rc=$rc)"                    | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              '```'                                             | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              Get-Content $logFile -Tail 150                    | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              '```'                                             | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              Write-Host "::error::cmake configure failed (rc=$rc)"
+              exit $rc
+          }
+          exit 0
 
       - name: Build Release
         shell: powershell
         run: |
-          cd $env:RUNNER_TEMP\citest
-          cmake --build buildvr --config Release
-          if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
+          $ErrorActionPreference = 'Continue'
+          $logFile = Join-Path $env:RUNNER_TEMP 'build.log'
+          Set-Location (Join-Path $env:RUNNER_TEMP 'citest')
+          cmake --build buildvr --config Release 2>&1 | Tee-Object -FilePath $logFile
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+              "## Build failed (rc=$rc)"     | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              '```'                          | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              Get-Content $logFile -Tail 150 | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              '```'                          | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              Write-Host "::error::cmake build failed (rc=$rc)"
+              exit $rc
+          }
+          exit 0
 
       - name: Gate -- the DLL must exist
         shell: powershell
         run: |
-          $dll = "$env:RUNNER_TEMP\citest\buildvr\Release\citest.dll"
+          $dll = Join-Path $env:RUNNER_TEMP 'citest\buildvr\Release\citest.dll'
           if (-not (Test-Path $dll)) {
-              Get-ChildItem "$env:RUNNER_TEMP\citest\buildvr" -Recurse -Filter *.dll |
+              Get-ChildItem (Join-Path $env:RUNNER_TEMP 'citest\buildvr') -Recurse -Filter *.dll -ErrorAction SilentlyContinue |
                   ForEach-Object { Write-Host "found: $($_.FullName)" }
               throw "gate failed: $dll not produced"
           }
-          Write-Host "PASS: $dll ($((Get-Item $dll).Length) bytes)"
+          $len = (Get-Item $dll).Length
+          Write-Host "PASS: $dll ($len bytes)"
+          "## PASS -- built ``citest.dll`` ($len bytes)" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          exit 0
+
+      # Everything below only runs when something above broke. vcpkg buries the real
+      # compiler error in per-port logs under buildtrees/, so surface those into the summary
+      # rather than requiring raw job logs to diagnose a red run.
+      - name: Surface vcpkg port logs on failure
+        if: failure()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $root = $env:VCPKG_ROOT
+          Write-Host "vcpkg root: $root"
+          $bt = Join-Path $root 'buildtrees'
+          if (-not (Test-Path $bt)) { Write-Host "no buildtrees at $bt"; exit 0 }
+          $logs = @(Get-ChildItem $bt -Recurse -Filter '*.log' -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 6)
+          if (-not $logs) { Write-Host 'no port logs found'; exit 0 }
+          "## vcpkg port logs (most recent $($logs.Count))" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          foreach ($l in $logs) {
+              Write-Host "===== $($l.FullName) ====="
+              $tail = Get-Content $l.FullName -Tail 80
+              $tail | ForEach-Object { Write-Host $_ }
+              "### $($l.Directory.Name)/$($l.Name)" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              '```'                                 | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              $tail                                 | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              '```'                                 | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
+          exit 0
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-logs
+          path: |
+            ${{ runner.temp }}/configure.log
+            ${{ runner.temp }}/build.log
+          if-no-files-found: warn
 
       - name: Upload the built plugin
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: citest-f4vr-plugin
