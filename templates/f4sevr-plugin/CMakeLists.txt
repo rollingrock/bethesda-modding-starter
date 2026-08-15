@@ -5,6 +5,10 @@ set(VERSION 0.1.0)
 # ---- Options ----
 option(COPY_BUILD "Copy the build output to the Fallout directory." FALSE)
 
+# VR is this template's default target. The `vr` preset sets this to true explicitly;
+# the flat preset sets it false. CommonLibF4 is NG-style, so the same tree builds both.
+option(BUILD_FALLOUTVR "Build against the Fallout 4 VR runtime (defines FALLOUTVR)." ON)
+
 # ---- Cache build vars ----
 macro(set_from_environment VARIABLE)
 	if(NOT DEFINED ${VARIABLE} AND DEFINED ENV{${VARIABLE}})
@@ -30,12 +34,19 @@ endmacro()
 
 set_from_environment(VCPKG_ROOT)
 
-add_compile_definitions(FALLOUTVR)
 add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 set(CommonLibName "CommonLibF4")
-set_from_environment(FalloutVRPath)
-set(FalloutPath ${FalloutVRPath})
-set(FalloutVersion "Fallout VR")
+
+if(BUILD_FALLOUTVR)
+	add_compile_definitions(FALLOUTVR)
+	set_from_environment(FalloutVRPath)
+	set(FalloutPath ${FalloutVRPath})
+	set(FalloutVersion "Fallout VR")
+else()
+	set_from_environment(Fallout4Path)
+	set(FalloutPath ${Fallout4Path})
+	set(FalloutVersion "Fallout 4")
+endif()
 
 if(BACKWARDS_COMPATIBLE)
 	add_compile_definitions(BACKWARDS_COMPATIBLE)

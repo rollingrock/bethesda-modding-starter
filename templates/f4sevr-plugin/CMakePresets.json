@@ -51,6 +51,14 @@
       "name": "vr"
     },
     {
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "BUILD_FALLOUTVR": false
+      },
+      "hidden": true,
+      "name": "flat"
+    },
+    {
       "cacheVariables": {
         "PACKAGE": true
       },
@@ -79,6 +87,15 @@
       "generator": "Visual Studio 17 2022",
       "inherits": ["vr", "cmake-dev", "vcpkg", "windows"],
       "name": "vs2022-windows-vcpkg-vr",
+      "toolset": "v143"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "/EHsc /MP /W4 /external:anglebrackets /external:W0 $penv{CXXFLAGS}"
+      },
+      "generator": "Visual Studio 17 2022",
+      "inherits": ["flat", "cmake-dev", "vcpkg", "windows"],
+      "name": "vs2022-windows-vcpkg",
       "toolset": "v143"
     },
     {

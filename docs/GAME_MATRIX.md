@@ -13,9 +13,10 @@ game; the pack's defaults are **bold**.
 ## Notes and traps
 
 - **One CommonLibF4 for flat and VR.** Don't go hunting for a separate VR lib — the fork is
-  NG-style. The template's `vs2022-windows-vcpkg-vr` preset defines `FALLOUTVR`; a flat build
-  is the same tree without it. VR/NG-specific structs are still early-stage in that fork; verify
-  offsets against the actual binary before trusting a struct layout.
+  NG-style. The template's `vs2022-windows-vcpkg-vr` preset sets `BUILD_FALLOUTVR=ON` (which
+  defines `FALLOUTVR` and builds into `buildvr/`); `vs2022-windows-vcpkg` sets it OFF for a flat
+  build into `build/`. Same tree, one switch. VR/NG-specific structs are still early-stage in
+  that fork; verify offsets against the actual binary before trusting a struct layout.
 - **F4VR never updates.** Runtime is 1.2.72 forever, which is why RE work there ages well.
 - **Address libraries let one DLL survive game patches** (flat games) by resolving IDs → offsets
   at runtime. On VR runtimes they are effectively a names database for RE plus a REL::ID source.
