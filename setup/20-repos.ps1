@@ -12,7 +12,7 @@
                          reading/searching the headers and for the CommonLibF4Path fallback.
       commonlibsf        libxse/commonlibsf — Starfield CommonLib (xmake-based).
       vr_address_tools   alandtse/vr_address_tools + the two VR address-library submodules
-                         (Skyrim VR + Fallout 4 VR offset CSVs). LARGE (~300 MB of CSV/JSON).
+                         (Skyrim VR + Fallout 4 VR offset CSVs). LARGE (~1.1 GB cloned).
       devbench           rollingrock/devbench, branch feat/multigame-core — in-game query
                          server (MCP+REST on loopback) for Skyrim (SKSE/xmake) and
                          Fallout 4 / FO4VR (F4SE/CMake). See docs/DEVBENCH.md.
@@ -22,7 +22,7 @@
 [CmdletBinding()]
 param(
     [string]$Root = 'C:\repos',
-    [switch]$SkipAddressTools   # skip the ~300 MB vr_address_tools clone
+    [switch]$SkipAddressTools   # skip the ~1.1 GB vr_address_tools clone
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,6 +38,7 @@ if (-not $SkipAddressTools) {
     $repos += @{ Name = 'vr_address_tools'; Url = 'https://github.com/alandtse/vr_address_tools.git'; Args = @('--recurse-submodules') }
 }
 
+$failed = @()
 foreach ($r in $repos) {
     $dest = Join-Path $Root $r.Name
     if (Test-Path (Join-Path $dest '.git')) {
@@ -46,7 +47,18 @@ foreach ($r in $repos) {
     }
     Write-Host "cloning $($r.Url) -> $dest"
     git clone @($r.Args) $r.Url $dest
-    if ($LASTEXITCODE -ne 0) { throw "clone failed: $($r.Url)" }
+    if ($LASTEXITCODE -ne 0) {
+        # Remove the partial clone: a half-cloned repo would pass the exists-check on
+        # re-run and hide the failure. Keep going — one bad repo must not block the rest.
+        if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+        $failed += $r.Url
+        Write-Warning "clone failed (cleaned up partial dir): $($r.Url)"
+    }
+}
+if ($failed) {
+    Write-Host ''
+    Write-Warning "FAILED clones: $($failed -join ', ') — re-run this script after fixing connectivity/URLs."
+    exit 1
 }
 
 Write-Host ''

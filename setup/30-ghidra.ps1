@@ -71,32 +71,46 @@ if (-not (Test-Path $venvExe)) {
 }
 Write-Host "Bridge: $venvExe"
 
-# 4. build + deploy the extension (Maven resolves Ghidra jars from the install)
-$extJar = Get-ChildItem (Join-Path $GhidraMcpDir 'target') -Filter 'GhidraMCP-*.zip' -ErrorAction SilentlyContinue
-if (-not $extJar) {
+# 4. install the Ghidra jars into ~/.m2, then build the extension with Maven directly.
+# We deliberately do NOT use ghidra-mcp's `tools.setup` here: it hard-requires `uv` and its
+# deploy step restarts Ghidra (dangerous under a running instance with unsaved analysis).
+# Everything it does for us is three plain steps: install-file the jars, mvn package, unzip.
+$extZip = Get-ChildItem (Join-Path $GhidraMcpDir 'target') -Filter 'GhidraMCP-*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $extZip) {
+    # The pom depends on ghidra:* artifacts that only exist inside a Ghidra install.
+    # Derive the list from the pom itself so upstream changes don't strand us.
+    $ghidraDeps = @($pom.project.dependencies.dependency | Where-Object groupId -eq 'ghidra')
+    Write-Host "Installing $($ghidraDeps.Count) Ghidra jars into the local Maven repo (version $ver) ..."
+    foreach ($dep in $ghidraDeps) {
+        $m2jar = Join-Path $env:USERPROFILE ".m2\repository\ghidra\$($dep.artifactId)\$ver\$($dep.artifactId)-$ver.jar"
+        if (Test-Path $m2jar) { continue }
+        $jar = Get-ChildItem $ghidraHome.FullName -Recurse -Filter "$($dep.artifactId).jar" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $jar) { throw "Could not find $($dep.artifactId).jar inside $($ghidraHome.FullName)" }
+        & mvn --quiet install:install-file "-Dfile=$($jar.FullName)" '-DgroupId=ghidra' `
+            "-DartifactId=$($dep.artifactId)" "-Dversion=$ver" '-Dpackaging=jar'
+        if ($LASTEXITCODE -ne 0) { throw "mvn install:install-file failed for $($dep.artifactId)" }
+    }
+    # Clear failed-download markers a previous broken attempt may have left; they make
+    # Maven ignore the jars we just installed.
+    Get-ChildItem (Join-Path $env:USERPROFILE '.m2\repository\ghidra') -Recurse -Filter '*.lastUpdated' -ErrorAction SilentlyContinue | Remove-Item -Force
+
     Write-Host 'Building the GhidraMCP extension (first run takes a few minutes) ...'
     Push-Location $GhidraMcpDir
     try {
-        & .\.venv\Scripts\python.exe -m tools.setup preflight --ghidra-path $ghidraHome.FullName
-        & .\.venv\Scripts\python.exe -m tools.setup ensure-prereqs --ghidra-path $ghidraHome.FullName
-        & .\.venv\Scripts\python.exe -m tools.setup build
+        & mvn clean package assembly:single -DskipTests --quiet
+        if ($LASTEXITCODE -ne 0) { throw 'Maven build of the GhidraMCP extension failed.' }
     }
     finally { Pop-Location }
+    $extZip = Get-ChildItem (Join-Path $GhidraMcpDir 'target') -Filter 'GhidraMCP-*.zip' | Select-Object -First 1
+    if (-not $extZip) { throw 'Build reported success but no GhidraMCP-*.zip in target/.' }
 }
-Write-Host 'Deploying the extension into the Ghidra user profile ...'
-Push-Location $GhidraMcpDir
-try {
-    & .\.venv\Scripts\python.exe -m tools.setup deploy --ghidra-path $ghidraHome.FullName
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning 'tools.setup deploy reported an error — falling back to manual unzip.'
-        $zip = Get-ChildItem (Join-Path $GhidraMcpDir 'target') -Filter 'GhidraMCP-*.zip' | Select-Object -First 1
-        $userExt = Join-Path $env:APPDATA "ghidra\$($ghidraHome.Name)\Extensions"
-        New-Item -ItemType Directory -Force $userExt | Out-Null
-        Expand-Archive $zip.FullName -DestinationPath $userExt -Force
-        Write-Host "Unpacked to $userExt — enable it via File > Install Extensions in Ghidra, then restart Ghidra."
-    }
-}
-finally { Pop-Location }
+
+# Deploy = unzip into the per-version user Extensions dir (the same thing Ghidra's
+# File > Install Extensions does). No Ghidra restart is ever triggered from here.
+$userExt = Join-Path $env:APPDATA "ghidra\$($ghidraHome.Name)\Extensions"
+New-Item -ItemType Directory -Force $userExt | Out-Null
+Expand-Archive $extZip.FullName -DestinationPath $userExt -Force
+Write-Host "Extension deployed to $userExt"
 
 # 5. script-execution gate for run_script_inline (JVM-side env var)
 if ([Environment]::GetEnvironmentVariable('GHIDRA_MCP_ALLOW_SCRIPTS', 'User') -ne '1') {

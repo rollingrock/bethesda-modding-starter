@@ -143,4 +143,6 @@ elseif ($Game -eq 'SF') {
 
     Write-Host ''
     Write-Host "Done: $target — see its README for build presets."
+    Write-Host 'NOTE: the template''s `default` preset uses the VS2026 generator. On a VS2022-only'
+    Write-Host 'machine use:  cmake --preset default -G "Visual Studio 17 2022"   (or the ninja preset).'
 }

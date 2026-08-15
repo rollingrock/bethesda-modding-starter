@@ -11,7 +11,9 @@
 [CmdletBinding()]
 param(
     [string]$VcpkgDir = 'C:\repos\vcpkg',
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    # Clone + bootstrap only; do not write persistent env vars (sandbox/CI runs).
+    [switch]$NoEnv
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,6 +28,11 @@ if (-not (Test-Path (Join-Path $VcpkgDir '.git'))) {
 if ((Test-Path $VcpkgDir) -and -not (Test-Path (Join-Path $VcpkgDir 'vcpkg.exe'))) {
     if ($CheckOnly) { Write-Host 'MISSING: vcpkg.exe (bootstrap not run)'; $ok = $false }
     else { & (Join-Path $VcpkgDir 'bootstrap-vcpkg.bat') -disableMetrics }
+}
+
+if ($NoEnv) {
+    Write-Host 'NoEnv: skipping persistent env var setup.'
+    return
 }
 
 foreach ($name in 'VCPKG_ROOT', 'VCPKG_INSTALLATION_ROOT') {
