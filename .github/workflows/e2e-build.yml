@@ -1,0 +1,107 @@
+name: E2E scaffold + build (F4VR)
+
+# CLAUDE.md calls the Phase 3 build "the real proof": it exercises VS2022 + C++23, CMake,
+# vcpkg restore, the CommonLibF4 submodule and the whole chain in one gate. This runs it on
+# a clean windows-latest runner, which is the closest thing to the fresh machine this pack
+# targets -- and free of the accumulated local state that hid the 5.1 parse bug.
+#
+# Deliberately NOT configured here: a git identity. A freshly installed git has none, and
+# New-Plugin.ps1 has to cope with that on its own. Leaving it unset keeps that guarantee
+# under test. (winget is likewise absent from the runner image, so 00-prereqs.ps1 is skipped
+# and the preinstalled VS2022/CMake/git are used instead.)
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  scaffold-and-build:
+    name: Scaffold an F4VR plugin and build it
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Confirm the fresh-machine assumptions this job relies on
+        shell: powershell
+        run: |
+          Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+          $name  = & git config --get user.name
+          $email = & git config --get user.email
+          Write-Host "git user.name  = '$name'"
+          Write-Host "git user.email = '$email'"
+          if ($name -and $email) {
+              Write-Host '::warning::Runner has a git identity configured; the no-identity path is not being exercised.'
+          }
+          else { Write-Host 'No git identity set -- New-Plugin.ps1 must handle this itself.' }
+
+      - name: Cache vcpkg binary archives
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('templates/f4sevr-plugin/vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      # Reuse the runner's preinstalled vcpkg when present. -NoEnv exists for exactly this
+      # case: bootstrap without writing persistent user env vars.
+      - name: vcpkg via setup/10-vcpkg.ps1
+        shell: powershell
+        run: |
+          $vcpkg = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkg -or -not (Test-Path $vcpkg)) { $vcpkg = Join-Path $env:RUNNER_TEMP 'vcpkg' }
+          Write-Host "Using vcpkg at $vcpkg"
+          .\setup\10-vcpkg.ps1 -VcpkgDir $vcpkg -NoEnv
+          # Both names, because CMakeLists.txt reads VCPKG_ROOT and CMakePresets.json reads
+          # VCPKG_INSTALLATION_ROOT -- the trap 10-vcpkg.ps1 documents.
+          "VCPKG_ROOT=$vcpkg"             | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_INSTALLATION_ROOT=$vcpkg" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Scaffold an F4VR plugin
+        shell: powershell
+        run: |
+          .\New-Plugin.ps1 -Name citest -Game F4VR -Dir $env:RUNNER_TEMP
+          $target = Join-Path $env:RUNNER_TEMP 'citest'
+          if (-not (Test-Path (Join-Path $target 'CMakeLists.txt'))) { throw 'scaffold produced no CMakeLists.txt' }
+          $hdr = Join-Path $target 'external\CommonLibF4\CommonLibF4\include\REL\Relocation.h'
+          if (-not (Test-Path $hdr)) { throw "CommonLibF4 submodule missing: $hdr" }
+          # The scaffolder must have produced a commit despite there being no git identity.
+          $log = & git -C $target log --oneline -1
+          if (-not $log) { throw 'scaffold did not produce a commit' }
+          Write-Host "scaffold commit: $log"
+
+      - name: Configure (vs2022-windows-vcpkg-vr)
+        shell: powershell
+        run: |
+          cd $env:RUNNER_TEMP\citest
+          cmake --preset vs2022-windows-vcpkg-vr
+          if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
+
+      - name: Build Release
+        shell: powershell
+        run: |
+          cd $env:RUNNER_TEMP\citest
+          cmake --build buildvr --config Release
+          if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
+
+      - name: Gate -- the DLL must exist
+        shell: powershell
+        run: |
+          $dll = "$env:RUNNER_TEMP\citest\buildvr\Release\citest.dll"
+          if (-not (Test-Path $dll)) {
+              Get-ChildItem "$env:RUNNER_TEMP\citest\buildvr" -Recurse -Filter *.dll |
+                  ForEach-Object { Write-Host "found: $($_.FullName)" }
+              throw "gate failed: $dll not produced"
+          }
+          Write-Host "PASS: $dll ($((Get-Item $dll).Length) bytes)"
+
+      - name: Upload the built plugin
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: citest-f4vr-plugin
+          path: |
+            ${{ runner.temp }}/citest/buildvr/Release/citest.dll
+            ${{ runner.temp }}/citest/buildvr/Release/citest.pdb
+          if-no-files-found: warn
