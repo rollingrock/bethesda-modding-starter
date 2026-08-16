@@ -240,10 +240,13 @@ names are worse still — **four unrelated types in this program are called `Ent
 across all 25,867 signature-carrying functions, argument types resolve as
 **14,194 exact + 10,443 builtin, against 22,670 unresolved.**
 
-So the honest ceiling on "make the decompiles typed" is roughly half the parameters, and the
-unresolved half clusters tightly: Havok (`hkbInternal`, `hkQsTransformf`, `hkaSkeleton`) and
-Bethesda containers CommonLibF4 does not model. **Importing Havok types is the single biggest
-lever** for raising it.
+So the honest ceiling on "make the decompiles typed" is roughly half the parameters. The
+unresolved half clusters tightly — Havok (`hkbInternal`, `hkQsTransformf`, `hkaSkeleton`) and
+Bethesda containers — and **that is not an import gap**: of the 19 most frequent unresolved
+tokens, 14 exist in neither the program's type manager nor CommonLibF4's headers, and none
+were present-in-headers-but-not-imported. BGS's type import is complete with respect to
+CommonLibF4. Raising the ceiling means authoring type definitions that do not exist yet, not
+re-running the importer.
 
 A Ghidra project is single-writer. If the enrichment pipeline (or a GUI, or another agent)
 holds the lock, `36-ghidra-mcp.ps1` says who has it and starts with no project rather than

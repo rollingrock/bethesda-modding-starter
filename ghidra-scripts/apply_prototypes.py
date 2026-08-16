@@ -201,6 +201,23 @@ class TypeIndex:
         for n in self.exact:
             self.by_leaf.setdefault(n.split("::")[-1], n)
 
+        # Ghidra keeps the RE:: namespace inside template arguments; the pipeline's names do
+        # not. `NiPointer<TESObjectREFR>` and `NiPointer<RE::TESObjectREFR>` (8 bytes, a real
+        # layout) are the same type. Canonicalising both sides recovers those -- and unlike
+        # the leaf fallback this is a normalisation, not a guess, so it is trusted as exact.
+        # Kept honest by dropping any key two different types canonicalise onto.
+        norm_hits: dict[str, list[str]] = {}
+        for n in self.exact:
+            norm_hits.setdefault(self._canon(n), []).append(n)
+        self.by_norm = {k: v[0] for k, v in norm_hits.items() if len(v) == 1}
+
+    @staticmethod
+    def _canon(name: str) -> str:
+        s = re.sub(r"\bRE::", "", name)
+        s = re.sub(r"\bconst\b|\bvolatile\b|\bclass\b|\bstruct\b|\benum\b|\bunion\b", " ", s)
+        s = s.replace("&", "*")
+        return re.sub(r"\s+", "", s)
+
     def is_placeholder(self, name: str) -> bool:
         """True only when the size is KNOWN and tiny.
 
@@ -235,6 +252,10 @@ class TypeIndex:
             return t, stars, "builtin"
         if t in self.exact and not self.is_placeholder(t):
             return t, stars, "exact"
+
+        hit = self.by_norm.get(self._canon(t))
+        if hit and not self.is_placeholder(hit):
+            return hit, stars, "normalized"
 
         bare = re.sub(r"<.*>", "", t).strip()
         if loose and bare in self.exact and not self.is_placeholder(bare):

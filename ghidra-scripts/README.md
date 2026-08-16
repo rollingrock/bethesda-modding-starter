@@ -91,14 +91,25 @@ Measured across all 25,867 signature-carrying functions:
 |---|---|
 | exact type match | 14,194 |
 | builtin (int/float/bool/...) | 10,443 |
-| **unresolved** | **22,670** |
+| recovered by normalising `RE::` | 241 |
+| **unresolved** | **22,429** |
 
 Unresolved parameters become `void *` in Tier 2 rather than a wrong struct. `--loose`
 relaxes this to accept a template's base name; it is off by default for the reasons above.
 
-The unresolved set clusters tightly — Havok (`hkbInternal`, `hkQsTransformf`, `hkaSkeleton`)
-and Bethesda containers CommonLibF4 does not model. Importing Havok types is the single
-biggest lever for raising Tier 1.
+The `RE::` normalisation is worth explaining because it looks like a bigger win than it is.
+Ghidra stores template arguments with the namespace (`NiPointer<RE::TESObjectREFR>`, 8 bytes,
+a real layout) while the pipeline's names omit it (`NiPointer<TESObjectREFR>`). Canonicalising
+both sides is a normalisation rather than a guess, so it is trusted like an exact match — but
+measured, it recovers only **241 of 47,363 tokens (0.5%)**.
+
+**The remaining gap is not an import gap.** Checked against CommonLibF4's headers directly:
+of the 19 most frequent unresolved tokens, **14 exist in neither the program's type manager
+nor CommonLibF4's source** — `hkQsTransformf`, `hkbContext`, `hkaSkeleton`,
+`hkbBehaviorGraph`, `BSScrapArray`, `BSTScatterTableEntry`, `BGSProcessContext` and so on.
+Zero were "in the headers but not imported". So BGS's type import is complete with respect to
+CommonLibF4, and closing this gap means **authoring type definitions that do not exist
+anywhere yet** — a real project, not a re-run of the importer.
 
 ### Gotcha found the hard way
 
