@@ -108,6 +108,20 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    Option 7's auto-analysis takes **hours per binary** — start it detached (or overnight) and
    do not interrupt it. Scope with `-OnlyGame <skyrim|f4|starfield|fnv>`; the other staged
    binaries are moved aside for the run and restored afterwards.
+
+   **F4VR needs a flat Fallout 4 binary staged alongside it.** BGS has no address-library
+   function symbols for VR (`Total symbols ... VR: 0`); it names VR functions by porting byte
+   signatures from a flat build. Stage only `exes\f4\vr\` and the run imports ~37k struct types
+   but names **13** functions, so BGS's own post-import check (`>=100 named functions`) rejects
+   it and **rolls every importer change back** — after the full analysis has been paid for. The
+   fix is to also stage `exes\f4\ng\Fallout4.exe` or `exes\f4\ae\Fallout4.exe`.
+   `35-ghidra-analysis.ps1` warns about this before running, not after.
+
+   **Do not treat the `.gpr` as proof of success.** Ghidra creates the project and imports the
+   binary *before* enrichment runs, and `run.py` exits 0 even when verification fails and rolls
+   back — so a failed run still leaves a several-hundred-MB project behind. The script reads
+   run.py's report and records its verdict in `.analysis-verified.json`; that file, not the
+   project directory, is what `-CheckOnly` trusts.
 3. ```powershell
    .\setup\30-ghidra.ps1   # builds the MCP extension against BGS's managed Ghidra
    ```

@@ -47,6 +47,11 @@ if (-not (Test-Path $BgsRoot)) {
 $exesRoot    = Join-Path $BgsRoot 'exes'
 $projectGpr  = Join-Path $BgsRoot 'ghidraprojects\BethesdaGhidraScripts\BethesdaGhidraScripts.gpr'
 $ghidraDir   = Join-Path $BgsRoot 'tools\ghidra'
+# The .gpr is NOT evidence of a good analysis: Ghidra creates the project and imports the
+# binary before the CommonLib enrichment runs, and a failed post-import verification rolls the
+# enrichment back while leaving a multi-hundred-MB project behind. Nothing on disk
+# distinguishes "enriched" from "imported then rolled back", so record our own verdict.
+$markerPath  = Join-Path $BgsRoot '.analysis-verified.json'
 
 # ---- What is staged? (mirrors BGS's own _discover_exes: exes\<game>\<ver>\*.exe) ----
 $staged = @()
@@ -84,11 +89,17 @@ $ErrorActionPreference = $prevEap
 $submodsReady = ($subRc -eq 0) -and $subStatus.Count -gt 0 -and
                 -not ($subStatus | Where-Object { $_ -match '^\-' })
 
+$verifiedGames = @()
+if (Test-Path $markerPath) {
+    try { $verifiedGames = @((Get-Content $markerPath -Raw | ConvertFrom-Json).games) } catch { $verifiedGames = @() }
+}
+
 Write-Host ''
 Write-Host "BethesdaGhidraScripts at $BgsRoot"
 Write-Host ("  tools (Ghidra/Clang/...) : " + $(if ($toolsReady) { 'installed' } else { 'MISSING -> menu 1' }))
 Write-Host ("  CommonLib submodules     : " + $(if ($submodsReady) { 'restored' } else { 'MISSING -> menu 2' }))
-Write-Host ("  Ghidra project           : " + $(if ($projectReady) { 'created' } else { 'not created -> menu 7' }))
+Write-Host ("  Ghidra project           : " + $(if ($projectReady) { 'present' } else { 'not created' }))
+Write-Host ("  Verified analysis for    : " + $(if ($verifiedGames.Count) { $verifiedGames -join ', ' } else { 'nothing yet' }))
 Write-Host ''
 if ($staged.Count -eq 0) {
     Write-Host '  No game executables staged under exes\. Nothing to analyze.'
@@ -98,6 +109,24 @@ if ($staged.Count -eq 0) {
 }
 Write-Host '  Staged binaries:'
 foreach ($s in $staged) { Write-Host ("    {0,-10} {1,-6} {2}" -f $s.Game, $s.Version, $s.Exe) }
+
+# Fallout 4 coverage preflight. BGS ships address-library symbols for the flat builds; VR and
+# OG get their function names by porting byte signatures ACROSS versions. With no NG/AE binary
+# staged, an f4 run imports types but names ~nothing, and BGS's own ">=100 named functions"
+# check then fails the run and rolls everything back -- after the full analysis has been paid
+# for. Say so before that happens, not after.
+$f4Versions   = @($staged | Where-Object { $_.Game -eq 'f4' } | Select-Object -ExpandProperty Version)
+$f4TypesOnly  = @($f4Versions | Where-Object { $_ -in 'vr', 'og' })
+$f4Donor      = @($f4Versions | Where-Object { $_ -in 'ng', 'ae', '221' })
+if ($f4TypesOnly.Count -gt 0 -and $f4Donor.Count -eq 0) {
+    Write-Host ''
+    Write-Warning ("Fallout 4 " + ($f4TypesOnly -join '/') + " is staged with no flat NG/AE binary.")
+    Write-Host '    BGS ports VR/OG function names from a flat build by byte signature. Without one'
+    Write-Host '    it can import types but names almost nothing, and its own post-import check'
+    Write-Host '    (>=100 named functions) then REJECTS the run and rolls it back -- so the hours'
+    Write-Host '    spent produce a project with no enrichment.'
+    Write-Host '    Stage exes\f4\ng\Fallout4.exe or exes\f4\ae\Fallout4.exe first if you can.'
+}
 
 if ($OnlyGame) {
     $match = @($staged | Where-Object { $_.Game -eq $OnlyGame })
@@ -109,16 +138,23 @@ if ($OnlyGame) {
 }
 
 # ---- Decide the menu sequence ----
+# Which games does this invocation care about, and are they already verified?
+$wantGames = if ($OnlyGame) { @($OnlyGame) } else { @($staged.Game | Select-Object -Unique) }
+$unverified = @($wantGames | Where-Object { $_ -notin $verifiedGames })
+
 $steps = @()
 if (-not $toolsReady)   { $steps += '1' }
 if (-not $submodsReady) { $steps += '2' }
-if ((-not $projectReady) -or $Force) { $steps += '7' }
+if ($unverified.Count -or $Force) { $steps += '7' }
 
 Write-Host ''
 if ($steps.Count -eq 0) {
-    Write-Host '  Nothing to do: tools, submodules and the Ghidra project are all present.'
-    Write-Host '  Re-run with -Force to rebuild the analysis anyway.'
+    Write-Host ("  Nothing to do: analysis already verified for " + ($wantGames -join ', ') + '.')
+    Write-Host '  Re-run with -Force to rebuild it anyway.'
     exit 0
+}
+if ($unverified.Count) {
+    Write-Host ("  Not yet verified: " + ($unverified -join ', '))
 }
 Write-Host ("  Menu sequence to run: " + ($steps -join ', '))
 if ($steps -contains '7') {
@@ -166,11 +202,12 @@ try {
     Write-Host ("  Driving run.py with: " + (($steps + 'q') -join ' ') + "  (this is the slow part)")
     Write-Host ''
 
+    $runLog = Join-Path $env:TEMP ("bgs-run-" + [Guid]::NewGuid().ToString('N') + ".log")
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     Push-Location $BgsRoot
     try {
-        & cmd /c "python run.py < `"$keyFile`""
+        & cmd /c "python run.py < `"$keyFile`"" 2>&1 | Tee-Object -FilePath $runLog
         $rc = $LASTEXITCODE
     }
     finally {
@@ -181,9 +218,17 @@ try {
 
     Write-Host ''
     Write-Host ("  run.py exit=$rc")
-    if ($rc -ne 0) {
-        Write-Warning 'run.py reported a non-zero exit. Check its output above before trusting the project.'
-    }
+
+    # run.py exits 0 even when a binary fails BGS's own post-import verification and every
+    # importer change is rolled back. The .gpr also exists either way -- it is created before
+    # the import runs. So neither the exit code nor the project file is a result; read the
+    # report instead.
+    $runOut = @(Get-Content $runLog -ErrorAction SilentlyContinue)
+    Remove-Item $runLog -Force -ErrorAction SilentlyContinue
+    $script:verifyFailures = @($runOut |
+        Where-Object { $_ -match 'VERIFICATION FAILURES|post-import verification failed|^\s*FAILURES:' })
+    $script:rolledBack = @($runOut | Where-Object { $_ -match 'changes were rolled back' })
+    $script:namedLow   = @($runOut | Where-Object { $_ -match 'Named functions too low' })
 }
 finally {
     Restore-HeldExes
@@ -192,12 +237,39 @@ finally {
 # ---- Report the outcome ----
 $projectNow = Test-Path $projectGpr
 Write-Host ''
-Write-Host ("  Ghidra project: " + $(if ($projectNow) { "created ($projectGpr)" } else { 'STILL NOT CREATED' }))
+Write-Host ("  Ghidra project file: " + $(if ($projectNow) { 'present' } else { 'NOT CREATED' }))
+
+if ($verifyFailures.Count -or $rolledBack.Count) {
+    Write-Host ''
+    Write-Warning 'BGS post-import verification FAILED; the importer changes were rolled back.'
+    foreach ($l in ($verifyFailures + $namedLow | Select-Object -Unique)) { Write-Host ("    $($l.Trim())") }
+    Write-Host ''
+    Write-Host '  The project exists but carries no usable enrichment. Most common cause on a'
+    Write-Host '  Fallout 4 setup: only the VR (or only the OG) binary is staged. BGS names VR'
+    Write-Host '  functions by porting byte signatures from a flat build, so with no NG/AE binary'
+    Write-Host '  under exes\f4\ it can import types but names almost nothing, and its own'
+    Write-Host '  >=100-named-functions check then rejects the run. Stage a flat Fallout 4'
+    Write-Host '  (exes\f4\ng\Fallout4.exe or exes\f4\ae\Fallout4.exe) and re-run.'
+    exit 1
+}
+
 if (-not $projectNow) {
     Write-Host '  The analysis did not produce a project. Re-run and read run.py output; a failed'
     Write-Host '  step there prompts for retry, which this script answers with EOF (i.e. gives up).'
     exit 1
 }
+Write-Host '  Post-import verification: passed.'
+
+# Only now is the analysis known good. Record it so a later -CheckOnly can answer "does this
+# still need to run?" without re-deriving it from a project directory that cannot tell us.
+$nowVerified = @($verifiedGames + $wantGames | Select-Object -Unique | Sort-Object)
+[pscustomobject]@{
+    games      = $nowVerified
+    verifiedAt = (Get-Date).ToString('s')
+    ghidra     = (Split-Path $ghidraDir -Leaf)
+} | ConvertTo-Json | Set-Content $markerPath -Encoding ascii
+Write-Host ("  Recorded verified analysis for: " + ($nowVerified -join ', '))
+
 Write-Host ''
 Write-Host 'Next: setup\30-ghidra.ps1 builds the MCP extension against this Ghidra, then open'
 Write-Host 'Ghidra (BGS menu 6) and start the MCP server. See CLAUDE.md Phase 4.'
