@@ -109,7 +109,11 @@ jobs:
               $inRun = $false; $indent = 0; $buf = @(); $isPs = $false; $blockStart = 0
               function Test-Block($wf, $start, $text, [ref]$bad) {
                   if (-not $text.Trim()) { return }
-                  # ${{ ... }} is substituted by GitHub before the shell sees it.
+                  # Strip GitHub expression interpolations before parsing: they are
+                  # substituted before the shell ever sees them, and their contents are not
+                  # PowerShell. (Deliberately not writing that syntax out literally here --
+                  # Actions evaluates it ANYWHERE in the file, comments inside run: blocks
+                  # included, and an invalid one makes the whole workflow unparseable.)
                   $clean = [regex]::Replace($text, '\$\{\{[^}]*\}\}', 'EXPR')
                   $errs = $null
                   $null = [System.Management.Automation.Language.Parser]::ParseInput($clean, [ref]$null, [ref]$errs)
@@ -140,6 +144,39 @@ jobs:
               exit 1
           }
           Write-Host 'Inline workflow PowerShell parses under 5.1.'
+
+      # GitHub evaluates its expression interpolations ANYWHERE in a workflow file --
+      # including inside a run: block, and including a comment inside that block. One
+      # invalid interpolation does not fail a step, it makes the whole workflow
+      # unparseable, and the only feedback is "This run likely failed because of a
+      # workflow file issue" with no line number. Assert every interpolation names a real
+      # context or function. (This file never writes that syntax literally, which is why
+      # the patterns below are escaped -- an unescaped one here would be evaluated too.)
+      - name: Workflow expression interpolations must be valid
+        shell: powershell
+        run: |
+          $open = '\$\{\{'
+          $bad = @()
+          Get-ChildItem .github\workflows -Filter *.yml -File | ForEach-Object {
+              $text = Get-Content $_.FullName -Raw
+              foreach ($m in [regex]::Matches($text, "$open(.*?)\}\}")) {
+                  $expr = $m.Groups[1].Value.Trim()
+                  # Valid roots per GitHub's contexts + the functions used in expressions.
+                  $ok = $expr -match '^[!\s]*(github|matrix|steps|runner|job|jobs|env|secrets|inputs|needs|vars|strategy)\.' -or
+                        $expr -match '^[!\s]*(always|failure|success|cancelled|hashFiles|contains|startsWith|endsWith|format|join|toJSON|fromJSON)\('
+                  if (-not $ok) {
+                      $line = ($text.Substring(0, $m.Index) -split "`n").Count
+                      $bad += "$($_.Name):$line"
+                      Write-Host "FAIL $($_.Name) line ${line}: not a valid expression -> $expr"
+                  }
+              }
+          }
+          if ($bad.Count) {
+              Write-Host ''
+              Write-Host 'Fix or reword these; a placeholder inside a comment still gets evaluated.'
+              exit 1
+          }
+          Write-Host 'All workflow expression interpolations reference a real context.'
 
       # Smoke test: these must EXECUTE, not merely parse. A bare runner is missing most
       # components, so a non-zero exit is expected and fine -- we only fail on a thrown
