@@ -169,29 +169,35 @@ jobs:
           Write-Host 'All artifacts present.'
 
       # ---------------------------------------------------------------- headless server
+      # ONE step on purpose. A background process does NOT survive the step that started
+      # it on a Windows runner -- the runner tears down the step's process tree, so a
+      # server started in step N is already gone in step N+1. Measured: -Start reported
+      # "HTTP server started on 127.0.0.1:8089" and the very next step got "Unable to
+      # connect to the remote server", with the server's own log ending cleanly (no crash).
+      # So start, assert and stop all have to live in a single step.
+      #
       # A loose system binary stands in for a game EXE: small enough to import in seconds,
       # and it exercises the same load path. Real game binaries belong in the pipeline.
-      - name: 36-ghidra-mcp.ps1 -Start (headless, loads a small binary)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $target = "$env:RUNNER_TEMP\subject.exe"
-          Copy-Item C:\Windows\System32\where.exe $target -Force
-          .\setup\36-ghidra-mcp.ps1 -Start -File $target -TimeoutSec 600
-          if ($LASTEXITCODE -ne 0) { throw "-Start reported failure (exit $LASTEXITCODE)." }
-
-      - name: Assert the server is actually useful
+      - name: Headless server -- start, assert it is useful, bridge, stop
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $base = 'http://127.0.0.1:8089'
 
+          Write-Host '::group::-Start'
+          $target = "$env:RUNNER_TEMP\subject.exe"
+          Copy-Item C:\Windows\System32\where.exe $target -Force
+          .\setup\36-ghidra-mcp.ps1 -Start -File $target -TimeoutSec 600
+          if ($LASTEXITCODE -ne 0) { throw "-Start reported failure (exit $LASTEXITCODE)." }
+          Write-Host '::endgroup::'
+
+          Write-Host '::group::endpoints'
           $conn = (Invoke-WebRequest "$base/check_connection" -UseBasicParsing -TimeoutSec 30).Content.Trim()
           Write-Host "check_connection : $conn"
 
           # /mcp/schema answers {"tools":[...],"count":N} -- NOT the {"data":...} envelope
           # other endpoints use. Reading .data here silently yields 0, which is exactly the
-          # bug that made this script once report "0 tools" against a healthy server.
+          # bug that made 36-ghidra-mcp.ps1 once report "0 tools" against a healthy server.
           $schema = (Invoke-WebRequest "$base/mcp/schema" -UseBasicParsing -TimeoutSec 60).Content | ConvertFrom-Json
           $tools = if ($null -ne $schema.count) { [int]$schema.count } else { @($schema.tools).Count }
           Write-Host "mcp tools        : $tools"
@@ -212,18 +218,16 @@ jobs:
           $dec = (Invoke-WebRequest "$base/decompile_function?address=0x$($first.address)" -UseBasicParsing -TimeoutSec 120).Content | ConvertFrom-Json
           if (-not $dec.decompiled) { throw "decompile_function returned no code for $($first.address)." }
           Write-Host "decompiled ok    : $($dec.decompiled.Length) chars"
+          Write-Host '::endgroup::'
 
-      - name: The BRIDGE must register tools (the real MCP contract)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          & C:\repos\ghidra-mcp\.venv\Scripts\python.exe .github\scripts\probe_bridge.py http://127.0.0.1:8089
+          # The REST endpoints answering is NOT the same as an agent getting tools; the
+          # bridge is what turns them into MCP tools. This is that contract.
+          Write-Host '::group::bridge registers tools'
+          & C:\repos\ghidra-mcp\.venv\Scripts\python.exe .github\scripts\probe_bridge.py $base
           if ($LASTEXITCODE -ne 0) { throw "probe_bridge.py failed (exit $LASTEXITCODE)." }
+          Write-Host '::endgroup::'
 
-      - name: -Status, then -Stop must leave nothing running
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
+          Write-Host '::group::-Status / -Stop'
           .\setup\36-ghidra-mcp.ps1 -Status
           .\setup\36-ghidra-mcp.ps1 -Stop
           Start-Sleep -Seconds 3
@@ -238,6 +242,7 @@ jobs:
               throw 'Port 8089 is still bound after -Stop.'
           }
           Write-Host 'Stopped cleanly: no JVM, port free.'
+          Write-Host '::endgroup::'
 
       # ---------------------------------------------------------------- error paths
       # These are contracts an agent depends on: a script that fails clearly is the
