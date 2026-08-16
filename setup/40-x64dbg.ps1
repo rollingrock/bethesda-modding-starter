@@ -76,3 +76,8 @@ Write-Host ''
 Write-Host 'Do NOT run `npx x64dbg-mcp-server --version` to check the install: it ignores the'
 Write-Host 'flag, starts the stdio server and waits forever. A good start prints'
 Write-Host '  [x64dbg-mcp] Server started (23 tools), plugin expected at 127.0.0.1:27042'
+
+# $LASTEXITCODE is set by native commands, not by a .ps1 falling off the end -- without
+# this an explicit success is indistinguishable from a stale exit code left by whatever
+# ran before. Callers (agents, CI, the other setup scripts) gate on it.
+exit 0

@@ -83,3 +83,8 @@ if ($failed) {
 Write-Host ''
 Write-Host 'Done. Plugin projects get CommonLib as a submodule automatically via New-Plugin.ps1;'
 Write-Host 'these clones are for browsing, devbench, and the RE tooling.'
+
+# $LASTEXITCODE is set by native commands, not by a .ps1 falling off the end -- without
+# this an explicit success is indistinguishable from a stale exit code left by whatever
+# ran before. Callers (agents, CI, the other setup scripts) gate on it.
+exit 0

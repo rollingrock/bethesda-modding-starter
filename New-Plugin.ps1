@@ -189,3 +189,8 @@ elseif ($Game -eq 'SF') {
     Write-Host 'NOTE: the template''s `default` preset uses the VS2026 generator. On a VS2022-only'
     Write-Host 'machine use:  cmake --preset default -G "Visual Studio 17 2022"   (or the ninja preset).'
 }
+
+# $LASTEXITCODE is set by native commands, not by a .ps1 falling off the end -- without
+# this an explicit success is indistinguishable from a stale exit code left by whatever
+# ran before. Callers (agents, CI, the other setup scripts) gate on it.
+exit 0

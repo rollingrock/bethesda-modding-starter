@@ -1,0 +1,290 @@
+name: Ghidra MCP bringup
+
+# Phase 4 is the part of this pack that kept breaking on a fresh machine, and every failure
+# was quiet: a winget package that does not exist, an extension built for the wrong Ghidra
+# version, a bridge that connects to nothing. This job runs the whole bringup on a clean
+# runner and asserts the things that were silently wrong before.
+#
+# WHAT THIS CANNOT COVER, deliberately: the analysis itself. 35-ghidra-analysis.ps1 needs
+# game executables staged under exes\<game>\<ver>\, and those come from the user's own game
+# installs -- they cannot be downloaded, and a full Bethesda binary takes HOURS against a
+# 6-hour job limit. So CI proves the bringup WORKS; only a real machine proves the database
+# is GOOD. The naming numbers in CLAUDE.md stay hand-measured for that reason.
+#
+# What it does cover, with no game assets at all:
+#   * gradlew builds the extension (no Maven -- there is no Apache.Maven package in winget)
+#   * the version gate: extension.properties version == the install's application.version
+#   * the headless server starts, serves its endpoints, and loads a program
+#   * the BRIDGE registers tools against it -- the actual "an agent gets tools" contract,
+#     which /mcp/schema answering does not by itself prove
+#   * -Stop leaves no JVM behind (a killed one strands a project lock)
+#
+# Matrixed over two Ghidra versions. 12.0.4 is the known-good one this pack is verified
+# against and it gates PRs. The `latest` leg is a drift detector for new Ghidra releases
+# breaking ghidra-mcp's compile; it is allowed to fail so upstream's timing never blocks a
+# PR here, and the weekly schedule is what makes it useful.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Mondays 06:00 UTC -- catches a new Ghidra release without anyone pushing.
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  bringup:
+    name: Bringup (Ghidra ${{ matrix.ghidra }})
+    runs-on: windows-latest
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.required == false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ghidra: '12.0.4'
+            required: true
+          - ghidra: 'latest'
+            required: false
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Ghidra 12 and the GhidraMCP build both need JDK 21+. Pin it rather than inherit
+      # whatever the image ships, so a runner-image bump cannot silently change the JDK.
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Resolve the Ghidra release to install
+        id: rel
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'bethesda-modding-starter-ci' }
+          $api = 'https://api.github.com/repos/NationalSecurityAgency/ghidra/releases?per_page=100'
+          $releases = Invoke-RestMethod $api -Headers $headers
+          if ('${{ matrix.ghidra }}' -eq 'latest') {
+              $rel = $releases | Where-Object { -not $_.prerelease -and -not $_.draft } | Select-Object -First 1
+          }
+          else {
+              $rel = $releases | Where-Object { $_.tag_name -eq 'Ghidra_${{ matrix.ghidra }}_build' } | Select-Object -First 1
+          }
+          if (-not $rel) { throw 'No matching Ghidra release for "${{ matrix.ghidra }}".' }
+          $asset = $rel.assets | Where-Object { $_.name -like 'ghidra_*_PUBLIC_*.zip' } | Select-Object -First 1
+          if (-not $asset) { throw "Release $($rel.tag_name) has no ghidra_*_PUBLIC_*.zip asset." }
+          # ghidra_12.0.4_PUBLIC_20260303.zip -> version 12.0.4, extracted dir ghidra_12.0.4_PUBLIC
+          if ($asset.name -notmatch '^ghidra_([0-9.]+)_PUBLIC_') { throw "Cannot parse a version out of $($asset.name)." }
+          $ver = $Matches[1]
+          Write-Host "release  : $($rel.tag_name)"
+          Write-Host "asset    : $($asset.name)  ($([math]::Round($asset.size/1MB)) MB)"
+          Write-Host "version  : $ver"
+          "version=$ver"              | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "asset=$($asset.name)"      | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "url=$($asset.browser_download_url)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "dir=C:\tools\ghidra_${ver}_PUBLIC"  | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # ~400 MB per download; cache it so a re-run and the weekly job are cheap.
+      - name: Cache the Ghidra install
+        id: ghidra-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.rel.outputs.dir }}
+          key: ghidra-${{ steps.rel.outputs.asset }}
+
+      - name: Download + extract Ghidra
+        if: steps.ghidra-cache.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force C:\tools | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP '${{ steps.rel.outputs.asset }}'
+          Write-Host 'Downloading ...'
+          # Invoke-WebRequest's progress rendering costs minutes on a 400 MB file in CI.
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest '${{ steps.rel.outputs.url }}' -OutFile $zip
+          Write-Host 'Extracting ...'
+          Expand-Archive $zip -DestinationPath C:\tools -Force
+          Remove-Item $zip
+
+      - name: Confirm the install looks like Ghidra
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $props = '${{ steps.rel.outputs.dir }}\Ghidra\application.properties'
+          if (-not (Test-Path $props)) { throw "No application.properties under ${{ steps.rel.outputs.dir }}" }
+          Get-Content $props | Select-String 'application.version|application.release.name'
+
+      - name: Clone ghidra-mcp
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force C:\repos | Out-Null
+          # Shallow: we build HEAD, we never need its history.
+          git clone --depth 1 https://github.com/bethington/ghidra-mcp.git C:\repos\ghidra-mcp
+          if ($LASTEXITCODE -ne 0) { throw 'clone failed' }
+          Write-Host "ghidra-mcp @ $(git -C C:\repos\ghidra-mcp rev-parse --short HEAD)"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle
+          key: gradle-${{ runner.os }}-${{ hashFiles('.github/workflows/ghidra-bringup.yml') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # ---------------------------------------------------------------- the pack's own script
+      - name: 30-ghidra.ps1 (build + deploy the extension, create the bridge venv)
+        shell: powershell
+        run: .\setup\30-ghidra.ps1 -GhidraPath '${{ steps.rel.outputs.dir }}'
+
+      - name: Assert what 30-ghidra.ps1 claims it produced
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = '.\setup\.ghidra-mcp-build.json'
+          if (-not (Test-Path $manifest)) { throw 'No setup\.ghidra-mcp-build.json -- 30-ghidra.ps1 did not finish.' }
+          $m = Get-Content $manifest -Raw | ConvertFrom-Json
+          $m | Format-List
+
+          # The version gate is the failure that produces an extension Ghidra silently will
+          # not load, so assert it here too rather than trusting the script's own check.
+          if ($m.ghidraVersion -ne '${{ steps.rel.outputs.version }}') {
+              throw "Manifest says Ghidra $($m.ghidraVersion), we installed ${{ steps.rel.outputs.version }}."
+          }
+          foreach ($p in @($m.pluginJar, $m.bridgeExe, $m.headlessCpFile, $m.extensionZip)) {
+              if (-not (Test-Path $p)) { throw "Missing artifact: $p" }
+          }
+          # The headless server cannot start without a real classpath; an empty or tiny
+          # argfile is the kind of thing that only shows up as a NoClassDefFoundError later.
+          $jars = ((Get-Content $m.headlessCpFile -Raw) -split ';').Count
+          Write-Host "classpath entries: $jars"
+          if ($jars -lt 50) { throw "Classpath argfile has only $jars entries; expected the full Ghidra jar set." }
+          Write-Host 'All artifacts present.'
+
+      # ---------------------------------------------------------------- headless server
+      # A loose system binary stands in for a game EXE: small enough to import in seconds,
+      # and it exercises the same load path. Real game binaries belong in the pipeline.
+      - name: 36-ghidra-mcp.ps1 -Start (headless, loads a small binary)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = "$env:RUNNER_TEMP\subject.exe"
+          Copy-Item C:\Windows\System32\where.exe $target -Force
+          .\setup\36-ghidra-mcp.ps1 -Start -File $target -TimeoutSec 600
+          if ($LASTEXITCODE -ne 0) { throw "-Start reported failure (exit $LASTEXITCODE)." }
+
+      - name: Assert the server is actually useful
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'http://127.0.0.1:8089'
+
+          $conn = (Invoke-WebRequest "$base/check_connection" -UseBasicParsing -TimeoutSec 30).Content.Trim()
+          Write-Host "check_connection : $conn"
+
+          # /mcp/schema answers {"tools":[...],"count":N} -- NOT the {"data":...} envelope
+          # other endpoints use. Reading .data here silently yields 0, which is exactly the
+          # bug that made this script once report "0 tools" against a healthy server.
+          $schema = (Invoke-WebRequest "$base/mcp/schema" -UseBasicParsing -TimeoutSec 60).Content | ConvertFrom-Json
+          $tools = if ($null -ne $schema.count) { [int]$schema.count } else { @($schema.tools).Count }
+          Write-Host "mcp tools        : $tools"
+          if ($tools -lt 100) { throw "Only $tools tools exposed; expected the full endpoint set." }
+
+          $meta = (Invoke-WebRequest "$base/get_metadata" -UseBasicParsing -TimeoutSec 60).Content
+          Write-Host "get_metadata     : $meta"
+          if ($meta -match 'No program loaded') { throw 'Server is up but no program is loaded.' }
+          $fnCount = ($meta | ConvertFrom-Json).function_count
+          if (-not $fnCount -or $fnCount -lt 1) { throw "Program loaded but function_count=$fnCount." }
+
+          # Prove analysis output is reachable, not just that the program opened.
+          $fns = (Invoke-WebRequest "$base/list_functions" -UseBasicParsing -TimeoutSec 120).Content | ConvertFrom-Json
+          $first = @($fns.functions)[0]
+          if (-not $first.name) { throw 'list_functions returned nothing usable.' }
+          Write-Host "first function   : $($first.name) @ $($first.address)"
+
+          $dec = (Invoke-WebRequest "$base/decompile_function?address=0x$($first.address)" -UseBasicParsing -TimeoutSec 120).Content | ConvertFrom-Json
+          if (-not $dec.decompiled) { throw "decompile_function returned no code for $($first.address)." }
+          Write-Host "decompiled ok    : $($dec.decompiled.Length) chars"
+
+      - name: The BRIDGE must register tools (the real MCP contract)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & C:\repos\ghidra-mcp\.venv\Scripts\python.exe .github\scripts\probe_bridge.py http://127.0.0.1:8089
+          if ($LASTEXITCODE -ne 0) { throw "probe_bridge.py failed (exit $LASTEXITCODE)." }
+
+      - name: -Status, then -Stop must leave nothing running
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\setup\36-ghidra-mcp.ps1 -Status
+          .\setup\36-ghidra-mcp.ps1 -Stop
+          Start-Sleep -Seconds 3
+          # A JVM left alive is what strands a project lock and blocks every later run.
+          $alive = @(Get-Process java, javaw -ErrorAction SilentlyContinue)
+          if ($alive.Count) {
+              $alive | Format-Table Id, ProcessName -AutoSize | Out-String | Write-Host
+              throw "-Stop left $($alive.Count) JVM(s) running."
+          }
+          # And the port must be free, or the next -Start refuses.
+          if (@(Get-NetTCPConnection -LocalPort 8089 -State Listen -ErrorAction SilentlyContinue).Count) {
+              throw 'Port 8089 is still bound after -Stop.'
+          }
+          Write-Host 'Stopped cleanly: no JVM, port free.'
+
+      # ---------------------------------------------------------------- error paths
+      # These are contracts an agent depends on: a script that fails clearly is the
+      # difference between "stage your EXEs" and an unattended run guessing.
+      - name: Scripts must fail clearly when their inputs are absent
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # BethesdaGhidraScripts is not cloned here (it is huge and needs game EXEs anyway),
+          # so 35-ghidra-analysis.ps1 must say so rather than half-run.
+          $threw = $false
+          try { .\setup\35-ghidra-analysis.ps1 -CheckOnly -BgsRoot 'C:\nope\not-here' }
+          catch { $threw = $true; Write-Host "expected throw: $_" }
+          if (-not $threw) { throw '35-ghidra-analysis.ps1 -CheckOnly did not fail on a missing BgsRoot.' }
+
+          # And -Start must refuse rather than run against a build that was never made.
+          Remove-Item .\setup\.ghidra-mcp-build.json -Force
+          $threw = $false
+          try { .\setup\36-ghidra-mcp.ps1 -Start }
+          catch { $threw = $true; Write-Host "expected throw: $_" }
+          if (-not $threw) { throw '36-ghidra-mcp.ps1 -Start did not fail with no build manifest.' }
+          Write-Host 'Both scripts failed clearly.'
+
+      - name: Summary
+        if: always()
+        shell: powershell
+        run: |
+          # No ternary here: this is Windows PowerShell 5.1 (see the ps-compat workflow).
+          $gating = if ('${{ matrix.required }}' -eq 'true') { 'yes' } else { 'no - drift detector' }
+          $lines = @(
+            "## Ghidra MCP bringup - ${{ matrix.ghidra }}",
+            '',
+            '| | |',
+            '|---|---|',
+            "| Ghidra | ${{ steps.rel.outputs.version }} (``${{ steps.rel.outputs.asset }}``) |",
+            "| Result | ${{ job.status }} |",
+            "| Gating | $gating |"
+          )
+          $lines -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Server logs on failure
+        if: failure()
+        shell: powershell
+        run: |
+          foreach ($f in '.\setup\.ghidra-headless.out.log', '.\setup\.ghidra-headless.err.log') {
+              if (Test-Path $f) {
+                  Write-Host "=== $f ==="
+                  Get-Content $f -Tail 60
+              }
+          }

@@ -402,3 +402,8 @@ Write-Host ("  Recorded verified analysis for: " + ($nowVerified -join ', '))
 Write-Host ''
 Write-Host 'Next: setup\30-ghidra.ps1 builds the MCP extension against this Ghidra, then open'
 Write-Host 'Ghidra (BGS menu 6) and start the MCP server. See CLAUDE.md Phase 4.'
+
+# $LASTEXITCODE is set by native commands, not by a .ps1 falling off the end -- without
+# this an explicit success is indistinguishable from a stale exit code left by whatever
+# ran before. Callers (agents, CI, the other setup scripts) gate on it.
+exit 0

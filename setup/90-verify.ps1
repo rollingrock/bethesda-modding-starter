@@ -140,3 +140,8 @@ if ($failed.Count) {
     exit 1
 }
 Write-Host 'Environment verified.'
+
+# $LASTEXITCODE is set by native commands, not by a .ps1 falling off the end -- without
+# this an explicit success is indistinguishable from a stale exit code left by whatever
+# ran before. Callers (agents, CI, the other setup scripts) gate on it.
+exit 0
