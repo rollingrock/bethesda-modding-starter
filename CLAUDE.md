@@ -223,15 +223,27 @@ Measured end to end on F4VR (2026-08-16), so you know what "done" looks like:
 | named (not `FUN_*`) | 61,136 (26.9%) |
 | fully-scoped `Class::Method(args)` | 25,883 |
 | data types loaded | 45,696, of which 44,738 under `/CommonLibF4/` |
+| ...but with a real layout (>1 byte) | far fewer — see below |
 
-**Names yes, prototypes no — do not expect typed decompiles.** The CommonLibF4 types are in
-the program, and the function *name* carries the full signature
+**Names yes, prototypes no — do not expect typed decompiles.** The function *name* carries
+the full signature
 (`BGSAIWorldLocationPointRadius::Allocate(NiPoint3&,TESObjectCELL*,TESWorldSpace*,float,float)`),
-but the function's applied prototype is still `undefined4 *param_1, longlong param_2, ...`.
-That is because the bulk of these names come from the VR address-library import, which sets
-names only. The signature you want is sitting in the name string and the types it references
-are already loaded, so `set_function_prototype` / `apply_data_type` can close the gap
-per-function — a worthwhile bulk pass, not something the pipeline does for you.
+but the applied prototype is still `undefined4 *param_1, longlong param_2, ...`, because the
+bulk of these names come from the VR address-library import, which sets names only.
+`ghidra-scripts/apply_prototypes.py` closes that gap — read its README before using it.
+
+**Do not read "44,738 types" as 44,738 usable types.** 32,182 of them carry template
+arguments and **27,813 of those are 1-byte stubs** — `NiPointer`, `BSTSmartPointer`, `CArgs`
+and `StreamRequest` included. Applying a 1-byte stub to a parameter is worse than leaving it
+`undefined`: the decompiler then reports field offsets that are confidently wrong. Bare leaf
+names are worse still — **four unrelated types in this program are called `Entry`**. Measured
+across all 25,867 signature-carrying functions, argument types resolve as
+**14,194 exact + 10,443 builtin, against 22,670 unresolved.**
+
+So the honest ceiling on "make the decompiles typed" is roughly half the parameters, and the
+unresolved half clusters tightly: Havok (`hkbInternal`, `hkQsTransformf`, `hkaSkeleton`) and
+Bethesda containers CommonLibF4 does not model. **Importing Havok types is the single biggest
+lever** for raising it.
 
 A Ghidra project is single-writer. If the enrichment pipeline (or a GUI, or another agent)
 holds the lock, `36-ghidra-mcp.ps1` says who has it and starts with no project rather than
