@@ -263,16 +263,35 @@ class TypeIndex:
         return None, stars, "unresolved"
 
 
-def parse_decompiled_arity(code: str) -> int | None:
-    """Count parameters in a decompiled function's signature line."""
-    head = code.split("{", 1)[0].strip()
+def parse_decompiled_head(code: str) -> tuple[int, str] | None:
+    """Return (parameter count, return type) from a decompiled signature line.
+
+    The return type matters as much as the arity. A demangled name carries no return type,
+    and setting a prototype REPLACES it -- so emitting a fixed `undefined8` would throw away
+    whatever the decompiler worked out (`bool`, `longlong *`, `undefined1 *` ...). Observed
+    in a review sample: most functions already have something better than undefined8. So we
+    read it here and put it back unchanged.
+    """
+    head = code.split("{", 1)[0]
+    head = re.sub(r"/\*.*?\*/", " ", head, flags=re.S)      # drop WARNING banners
+    head = re.sub(r"\s+", " ", head).strip()
     m = re.search(r"\(([^()]*(?:\([^()]*\)[^()]*)*)\)\s*$", head)
     if not m:
         return None
     inner = m.group(1).strip()
-    if inner in ("", "void"):
-        return 0
-    return len(split_top_level(inner))
+    arity = 0 if inner in ("", "void") else len(split_top_level(inner))
+
+    # everything before the function name is the return type
+    decl = head[: m.start()].strip()
+    parts = decl.rsplit(" ", 1)
+    ret = parts[0].strip() if len(parts) == 2 else ""
+    if parts and len(parts) == 2 and parts[1].startswith("*"):
+        ret = (parts[0] + " *").strip()
+    ret = re.sub(r"\s+", " ", ret)
+    # A bare identifier means the decompiler gave no return type at all.
+    if not ret or ret in ("__thiscall", "__fastcall", "__cdecl", "__stdcall"):
+        ret = "undefined8"
+    return arity, ret
 
 
 # ---------------------------------------------------------------- phases
@@ -317,7 +336,13 @@ def load_candidates(args):
         resolved = [index.resolve(a, loose=args.loose) for a in raw_args]
         cls_type = None
         if cls:
-            cls_type, _, _ = index.resolve(re.sub(r"<.*>", "", cls).strip(), loose=args.loose)
+            # Try the FULL templated name first. Stripping <...> straight away lands on the
+            # bare template, which is a 1-byte stub -- so BSTArray<Foo,Bar>::Method got
+            # `void * this` even though BSTArray<RE::Foo,RE::Bar> exists with a real 24-byte
+            # layout. Only fall back to the bare name when the instantiation is absent.
+            cls_type, _, _ = index.resolve(cls, loose=args.loose)
+            if cls_type is None:
+                cls_type, _, _ = index.resolve(re.sub(r"<.*>", "", cls).strip(), loose=args.loose)
         out.append({
             "address": f["address"],
             "name": name,
@@ -341,7 +366,21 @@ def phase_probe(args) -> None:
             known = json.load(fh)
         print(f"resuming: {len(known):,} already probed")
 
-    todo = [c for c in cands if c["address"] not in known]
+    # An entry cached before return-type capture is an int, not a record. Those still need
+    # re-probing: the return type is not recoverable from the arity alone.
+    def needs_probe(addr: str) -> bool:
+        v = known.get(addr)
+        return v is None or isinstance(v, int)
+
+    todo = [c for c in cands if needs_probe(c["address"])]
+    if args.from_plan:
+        plan_file = cache_path(args, "plan.json")
+        if not os.path.exists(plan_file):
+            raise SystemExit("--from-plan needs plan.json; run `report` first.")
+        with open(plan_file, encoding="utf-8") as fh:
+            wanted = {row["address"] for row in json.load(fh)}
+        todo = [c for c in todo if c["address"] in wanted]
+        print(f"restricted to the {len(wanted):,} addresses already in the plan")
     if args.only_resolvable:
         todo = [c for c in todo if all(r[0] for r in c["resolved"])]
     if args.limit:
@@ -377,11 +416,11 @@ def phase_probe(args) -> None:
         for c in chunk:
             entry = body.get("0x" + c["address"], body.get(c["address"]))
             code = entry.get("decompiled") if isinstance(entry, dict) else entry
-            arity = parse_decompiled_arity(code) if isinstance(code, str) else None
-            if arity is None:
+            parsed = parse_decompiled_head(code) if isinstance(code, str) else None
+            if parsed is None:
                 unparsed += 1
             else:
-                known[c["address"]] = arity
+                known[c["address"]] = {"arity": parsed[0], "ret": parsed[1]}
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(known, fh)
         done = i + len(chunk)
@@ -398,9 +437,20 @@ def phase_probe(args) -> None:
     print(f"probed {len(known):,} total -> {path}")
 
 
-def classify(c: dict, arity: dict[str, int]) -> tuple[str, str]:
+def probe_entry(arity: dict, address: str) -> tuple[int, str] | None:
+    """Read one probe record, tolerating the older arity-only cache format."""
+    v = arity.get(address)
+    if v is None:
+        return None
+    if isinstance(v, int):                    # pre-return-type cache
+        return v, "undefined8"
+    return v.get("arity"), v.get("ret", "undefined8")
+
+
+def classify(c: dict, arity: dict) -> tuple[str, str]:
     """Return (tier, reason). Tier 1 = safe to apply, 3 = skip."""
-    inferred = arity.get(c["address"])
+    rec = probe_entry(arity, c["address"])
+    inferred = rec[0] if rec else None
     all_ok = all(r[0] for r in c["resolved"])
     some_ok = any(r[0] for r in c["resolved"]) or c["n_args"] == 0
 
@@ -422,11 +472,14 @@ def classify(c: dict, arity: dict[str, int]) -> tuple[str, str]:
     return "3", "no argument type resolves"
 
 
-def build_prototype(c: dict, this_kind: str, fill_unresolved: bool) -> str | None:
+def build_prototype(c: dict, this_kind: str, fill_unresolved: bool,
+                    ret: str = "undefined8") -> str | None:
     """Compose a prototype Ghidra's parser will accept.
 
-    Return type is ALWAYS undefined8: the name does not carry one, and inventing `void`
-    would throw away what the decompiler already worked out.
+    `ret` is the decompiler's OWN current return type, carried through unchanged. The name
+    carries no return type, and applying a prototype replaces whatever is there -- so a
+    hardcoded `undefined8` would silently downgrade functions the decompiler had already
+    typed as `bool`, `longlong *`, `undefined1 *` and so on.
     """
     params: list[str] = []
     if this_kind == "this":
@@ -442,7 +495,7 @@ def build_prototype(c: dict, this_kind: str, fill_unresolved: bool) -> str | Non
             ty, stars = "void", max(stars, 1)
         params.append(f"{ty} {'*' * stars} a_{i}".replace("  ", " "))
     inner = ", ".join(params) if params else "void"
-    return f"undefined8 {sanitize_identifier(c['member'])}({inner})"
+    return f"{ret} {sanitize_identifier(c['member'])}({inner})"
 
 
 def phase_report(args) -> None:
@@ -462,7 +515,9 @@ def phase_report(args) -> None:
         if tier == "3":
             reasons[reason] += 1
             continue
-        proto = build_prototype(c, reason, fill_unresolved=(tier == "2"))
+        rec = probe_entry(arity, c["address"])
+        proto = build_prototype(c, reason, fill_unresolved=(tier == "2"),
+                                ret=(rec[1] if rec else "undefined8"))
         if proto is None:
             tiers[tier] -= 1
             tiers["3"] += 1
@@ -572,6 +627,9 @@ def main() -> int:
                     help=f"functions per decompile request (probe); server caps at {DECOMPILE_BATCH_CAP}")
     ap.add_argument("--only-resolvable", action="store_true",
                     help="probe only functions whose arg types all resolve -- the Tier 1 shortlist")
+    ap.add_argument("--from-plan", action="store_true",
+                    help="probe only addresses already in plan.json (cheap way to top up an "
+                         "existing plan without re-probing the whole corpus)")
     ap.add_argument("--tier", choices=["1", "2"], help="restrict apply to one tier")
     ap.add_argument("--loose", action="store_true",
                     help="also accept a templated type's BASE name (BSTSmartPointer for "
