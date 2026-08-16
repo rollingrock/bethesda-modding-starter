@@ -109,13 +109,21 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    do not interrupt it. Scope with `-OnlyGame <skyrim|f4|starfield|fnv>`; the other staged
    binaries are moved aside for the run and restored afterwards.
 
-   **F4VR needs a flat Fallout 4 binary staged alongside it.** BGS has no address-library
-   function symbols for VR (`Total symbols ... VR: 0`); it names VR functions by porting byte
-   signatures from a flat build. Stage only `exes\f4\vr\` and the run imports ~37k struct types
-   but names **13** functions, so BGS's own post-import check (`>=100 named functions`) rejects
-   it and **rolls every importer change back** — after the full analysis has been paid for. The
-   fix is to also stage `exes\f4\ng\Fallout4.exe` or `exes\f4\ae\Fallout4.exe`.
-   `35-ghidra-analysis.ps1` warns about this before running, not after.
+   **The improve pass (menu 9) is not optional on VR — it is where the names come from.**
+   BGS has no address-library function symbols for Fallout 4 VR (`Total symbols ... VR: 0`):
+   VR and OG use ID namespaces CommonLibF4 does not reference, so option 7 alone imports ~37k
+   struct types, names **13** functions, and its own `>=100 named functions` check then rejects
+   and rolls that apply back. Menu 9 fixes this without any extra binary — it re-applies the
+   true-VR importer and then walks RTTI vtables **in the VR binary itself**. Measured on F4VR
+   1.2.72 with nothing else staged: 12,150 vtables discovered, **13 → 34,507 named functions**
+   of 216,903 (+34,494), and the changes are *saved*, not rolled back. `35-ghidra-analysis.ps1`
+   runs it automatically after option 7 (`-SkipImprove` opts out).
+
+   Staging a flat Fallout 4 (`exes\f4\ae\Fallout4.exe`, or `\ng\`) is still worth doing but is
+   an *upgrade*, not a prerequisite: it anchors the cross-version byte-signature port, which
+   adds real CommonLib function names on top of the RTTI-derived ones. `exes\f4\221\` further
+   unlocks a 38k-record community PDB-publics corpus, which is identity-bound by SHA-256 — the
+   corpus is silently skipped (`PDB publics: 0 loaded`) unless that exact binary is staged.
 
    **Do not treat the `.gpr` as proof of success.** Ghidra creates the project and imports the
    binary *before* enrichment runs, and `run.py` exits 0 even when verification fails and rolls

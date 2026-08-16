@@ -91,10 +91,21 @@ Auto-analysis takes hours per Bethesda binary; let it finish. Afterwards:
 (`tools/ghidra` inside the repo) when present, so one Ghidra serves both the pipeline and the
 MCP bridge. Back up the project directory before any mass-modifying script.
 
-**Fork note (2026-08):** `alandtse/BethesdaGhidraScripts` is an actively developed sibling
-fork (rules-format + enrichment refactors); the 1001Bits fork uniquely carries the true-VR
-importers, the option-10 export suite, TTD dispatch xrefs and IDA name-ports. They have
-diverged — the pack defaults to 1001Bits for the VR features; check both before deep work.
+**Fork note (verified 2026-08-15):** `alandtse/BethesdaGhidraScripts` is a fork **of
+1001Bits** (not a sibling — 1001Bits itself forks doodlum), and the two have diverged:
+1001Bits is 15 commits ahead, 119 behind. Checked rather than assumed, the split is real and
+lopsided by topic:
+
+- **1001Bits uniquely carries the true-VR support.** It vendors `extern/CommonLibF4VR`
+  (ArthurHub) as a submodule; alandtse has no such submodule at all. Its `feat(vr): true VR
+  struct + vtable layouts for Skyrim VR and Fallout 4 VR` commit is absent downstream, as are
+  the IDA OG name-port, PDB generation and TTD dispatch xrefs.
+- **alandtse's 119 commits are almost entirely `commonlibvr` type quality** — layout-drift
+  detection, bitfield comparison, duplicate/cascade fixes, `LibraryRulesFormat`.
+
+So the pack defaults to 1001Bits, and **for Fallout 4 VR that is not a preference but a
+requirement** — the other fork cannot emit true-VR layouts. Worth re-checking alandtse before
+deep *Skyrim VR type* work, where its enrichment fixes are the newer ones.
 
 The single-file `../ghidra-scripts/ImportAddressLibrary.py` remains as a minimal fallback
 (names only, needs the Jython extension) for when you don't want the full pipeline.

@@ -35,7 +35,11 @@ param(
     [string]$OnlyGame = '',
 
     # Re-run the analysis even when a Ghidra project already exists.
-    [switch]$Force
+    [switch]$Force,
+
+    # Skip the menu-9 improve pass (CommonLib apply + RTTI vtable walk + reconciler).
+    # That pass is what makes a VR-only setup worth anything -- see the note below.
+    [switch]$SkipImprove
 )
 
 $ErrorActionPreference = 'Stop'
@@ -121,11 +125,14 @@ $f4Donor      = @($f4Versions | Where-Object { $_ -in 'ng', 'ae', '221' })
 if ($f4TypesOnly.Count -gt 0 -and $f4Donor.Count -eq 0) {
     Write-Host ''
     Write-Warning ("Fallout 4 " + ($f4TypesOnly -join '/') + " is staged with no flat NG/AE binary.")
-    Write-Host '    BGS ports VR/OG function names from a flat build by byte signature. Without one'
-    Write-Host '    it can import types but names almost nothing, and its own post-import check'
-    Write-Host '    (>=100 named functions) then REJECTS the run and rolls it back -- so the hours'
-    Write-Host '    spent produce a project with no enrichment.'
-    Write-Host '    Stage exes\f4\ng\Fallout4.exe or exes\f4\ae\Fallout4.exe first if you can.'
+    Write-Host '    F4 VR and OG use ID namespaces CommonLibF4 does not reference, so names can'
+    Write-Host '    only arrive via the cross-version byte-signature port -- which needs an AE'
+    Write-Host '    (or NG) binary to anchor on. Without one, option 7 imports types, names ~13'
+    Write-Host '    functions, and its own >=100-named check rejects and rolls that apply back.'
+    Write-Host '    This is NOT fatal: the improve pass (menu 9) then walks RTTI vtables in the VR'
+    Write-Host '    binary itself and needs no donor -- measured here at 13 -> 34,507 named.'
+    Write-Host '    Staging exes\f4\ae\Fallout4.exe (or \ng\) additionally unlocks the byte-sig'
+    Write-Host '    port for real CommonLib function names on top of that.'
 }
 
 if ($OnlyGame) {
@@ -244,13 +251,12 @@ if ($verifyFailures.Count -or $rolledBack.Count) {
     Write-Warning 'BGS post-import verification FAILED; the importer changes were rolled back.'
     foreach ($l in ($verifyFailures + $namedLow | Select-Object -Unique)) { Write-Host ("    $($l.Trim())") }
     Write-Host ''
-    Write-Host '  The project exists but carries no usable enrichment. Most common cause on a'
-    Write-Host '  Fallout 4 setup: only the VR (or only the OG) binary is staged. BGS names VR'
-    Write-Host '  functions by porting byte signatures from a flat build, so with no NG/AE binary'
-    Write-Host '  under exes\f4\ it can import types but names almost nothing, and its own'
-    Write-Host '  >=100-named-functions check then rejects the run. Stage a flat Fallout 4'
-    Write-Host '  (exes\f4\ng\Fallout4.exe or exes\f4\ae\Fallout4.exe) and re-run.'
-    exit 1
+    Write-Host '  Expected when only a VR (or only an OG) Fallout 4 binary is staged: those two'
+    Write-Host '  use ID namespaces CommonLibF4 does not reference, so names can only arrive via'
+    Write-Host '  the cross-version byte-signature port, which needs an AE/NG binary to anchor on.'
+    Write-Host '  The import and Ghidra auto-analysis DID survive -- only the name/type apply was'
+    Write-Host '  rolled back -- so the improve pass below can still rescue this run.'
+    $script:importRolledBack = $true
 }
 
 if (-not $projectNow) {
@@ -258,7 +264,69 @@ if (-not $projectNow) {
     Write-Host '  step there prompts for retry, which this script answers with EOF (i.e. gives up).'
     exit 1
 }
-Write-Host '  Post-import verification: passed.'
+
+# ---- Menu 9: CommonLib apply + RTTI vtable walk + reconciler ----
+# This is what rescues a VR-only setup. The RTTI walk derives names from vtables in the
+# binary itself, so it needs no donor: on Fallout 4 VR with nothing else staged it took the
+# program from 13 named functions out of 201,005 to 34,507 out of 216,903 (+34,494), and the
+# changes were SAVED rather than rolled back. Run it whenever a run completed, whether or not
+# option 7's own verification passed.
+if (-not $SkipImprove) {
+    Write-Host ''
+    Write-Host '  Improve pass (menu 9: CommonLib apply + RTTI vtable walk + reconciler) ...'
+
+    # Menu 9 wants a project index then a program index, and the program list depends on what
+    # has been imported so far -- so ask it, rather than assuming index 1.
+    $probeKeys = Join-Path $env:TEMP ("bgs-probe-" + [Guid]::NewGuid().ToString('N') + ".txt")
+    Set-Content $probeKeys "9`n1`nb`nq`n" -Encoding ascii
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    Push-Location $BgsRoot
+    try { $probe = @(& cmd /c "python run.py < `"$probeKeys`"" 2>&1) }
+    finally { Pop-Location; $ErrorActionPreference = $prevEap; Remove-Item $probeKeys -Force -ErrorAction SilentlyContinue }
+
+    # Lines look like:   1) /f4/vr/Fallout4VR.exe.unpacked.exe
+    $programs = @()
+    foreach ($line in $probe) {
+        if ($line -match '^\s*(\d+)\)\s+(/\S+)') {
+            $programs += [pscustomobject]@{ Index = $Matches[1]; Path = $Matches[2] }
+        }
+    }
+    if ($programs.Count -eq 0) {
+        Write-Warning '  Could not read the program list from menu 9; skipping the improve pass.'
+    }
+    else {
+        $targets = if ($OnlyGame) { @($programs | Where-Object { $_.Path -match "^/$OnlyGame/" }) } else { $programs }
+        if ($targets.Count -eq 0) { $targets = $programs }
+        foreach ($t in $targets) {
+            Write-Host ("    improving $($t.Path) (program $($t.Index)) ...")
+            $keys = Join-Path $env:TEMP ("bgs-imp-" + [Guid]::NewGuid().ToString('N') + ".txt")
+            # 9, project 1, program N, then 'Y' to the "Apply CommonLibImport first?" prompt.
+            Set-Content $keys "9`n1`n$($t.Index)`nY`nq`n" -Encoding ascii
+            $impLog = Join-Path $env:TEMP ("bgs-imp-" + [Guid]::NewGuid().ToString('N') + ".log")
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            Push-Location $BgsRoot
+            try { & cmd /c "python run.py < `"$keys`"" 2>&1 | Tee-Object -FilePath $impLog | Out-Null }
+            finally { Pop-Location; $ErrorActionPreference = $prevEap; Remove-Item $keys -Force -ErrorAction SilentlyContinue }
+
+            $impOut = @(Get-Content $impLog -ErrorAction SilentlyContinue)
+            Remove-Item $impLog -Force -ErrorAction SilentlyContinue
+            $named = @($impOut | Where-Object { $_ -match 'named after:' }) | Select-Object -Last 1
+            $delta = @($impOut | Where-Object { $_ -match '^\s*delta:' })   | Select-Object -Last 1
+            if ($named) { Write-Host ("      $($named.Trim())") }
+            if ($delta) { Write-Host ("      $($delta.Trim())") }
+            if (-not $named) { Write-Warning "      no naming summary from the improve pass for $($t.Path)" }
+        }
+    }
+}
+
+Write-Host ''
+if ($importRolledBack) {
+    Write-Host '  Note: option 7 rolled its own type/name apply back; the improve pass above is'
+    Write-Host '  what this project is carrying. That is expected for a VR-only Fallout 4 setup.'
+}
+else { Write-Host '  Post-import verification: passed.' }
 
 # Only now is the analysis known good. Record it so a later -CheckOnly can answer "does this
 # still need to run?" without re-deriving it from a project directory that cannot tell us.
