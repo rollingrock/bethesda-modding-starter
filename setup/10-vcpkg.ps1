@@ -37,6 +37,52 @@ if (-not (Test-Path (Join-Path $VcpkgDir '.git'))) {
         Invoke-Native 'git clone vcpkg' { git clone https://github.com/microsoft/vcpkg.git $VcpkgDir }
     }
 }
+elseif (-not $CheckOnly) {
+    # An EXISTING clone goes stale, and a stale vcpkg breaks manifests two different ways:
+    #   1. The pinned `builtin-baseline` commit isn't present at all ->
+    #      "failed to `git show` versions/baseline.json ... exists on disk, but not in <sha>"
+    #   2. The commit IS present but the CHECKED-OUT versions/ database predates the versions
+    #      that baseline names -> "no version database entry for spdlog at 1.17.0"
+    # Both read like a corrupt checkout rather than an old one. Fetching alone only fixes (1),
+    # because vcpkg looks port versions up in the working tree -- so fast-forward as well.
+    # Safe for pinned manifests: a newer tree is a superset of version entries, and each
+    # project still resolves against its own builtin-baseline.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    git -C $VcpkgDir fetch origin --quiet
+    $fetchRc = $LASTEXITCODE
+    $dirty = (git -C $VcpkgDir status --porcelain)
+    $behind = (git -C $VcpkgDir rev-list --count 'HEAD..@{u}' 2>$null)
+    $ErrorActionPreference = $prev
+
+    if ($fetchRc -ne 0) {
+        Write-Warning "vcpkg fetch failed (exit $fetchRc); a manifest pinning a newer baseline may not configure."
+    }
+    elseif ($dirty) {
+        Write-Warning "vcpkg checkout at $VcpkgDir has local changes; leaving it alone. If a build reports a missing version database entry, update it by hand."
+    }
+    elseif ($behind -and [int]$behind -gt 0) {
+        Write-Host "vcpkg is $behind commits behind; fast-forwarding (pinned baselines are unaffected) ..."
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        git -C $VcpkgDir merge --ff-only '@{u}' --quiet
+        $ffRc = $LASTEXITCODE
+        $ErrorActionPreference = $prev
+        if ($ffRc -ne 0) { Write-Warning "vcpkg fast-forward failed (exit $ffRc); update $VcpkgDir by hand." }
+        else {
+            # The repo and the vcpkg.exe built from it are versioned together. Advancing the
+            # checkout without re-bootstrapping leaves an old tool against new scripts, which
+            # fails every configure with "vcpkg-tools.json: document schema version 2 is not
+            # supported by this version of vcpkg" -- a message that says nothing about the
+            # tool being stale. Rebuild it whenever the checkout moved.
+            Write-Host 'Re-bootstrapping vcpkg.exe to match the updated checkout ...'
+            Invoke-Native 'bootstrap-vcpkg (post-update)' {
+                & (Join-Path $VcpkgDir 'bootstrap-vcpkg.bat') -disableMetrics
+            }
+        }
+    }
+    else { Write-Host 'vcpkg is up to date.' }
+}
 if ((Test-Path $VcpkgDir) -and -not (Test-Path (Join-Path $VcpkgDir 'vcpkg.exe'))) {
     if ($CheckOnly) { Write-Host 'MISSING: vcpkg.exe (bootstrap not run)'; $ok = $false }
     else { Invoke-Native 'bootstrap-vcpkg' { & (Join-Path $VcpkgDir 'bootstrap-vcpkg.bat') -disableMetrics } }

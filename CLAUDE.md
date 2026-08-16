@@ -92,11 +92,22 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    `C:\repos\BethesdaGhidraScripts\exes\<game>\<ver>\<Game>.exe` (paths in its README —
    the EXEs come from the user's game installs; you cannot download them).
 2. ```powershell
-   cd C:\repos\BethesdaGhidraScripts
-   python run.py    # menu option 1 (prereqs incl. its own pinned Ghidra), then 2, then 7
+   .\setup\35-ghidra-analysis.ps1 -CheckOnly       # what's staged, what's still needed
+   .\setup\35-ghidra-analysis.ps1                  # runs it; -OnlyGame f4 to scope
    ```
-   Option 7's auto-analysis takes **hours per binary** — schedule it (e.g. overnight) and do
-   not interrupt it. The menu's status panel shows what's detected.
+   **You can run this yourself — do not hand it back to the user.** BGS ships an interactive
+   menu, but the items this needs (1 prereqs, 2 submodules, 7 full rebuild) each run straight
+   through without prompting, and 7 discovers every staged binary on its own, so the script
+   drives them by feeding menu keys on stdin. Prompts only appear in the other submenus and on
+   failure-retry; `run.py` treats EOF as quit.
+
+   `-CheckOnly` answers "does Ghidra need to run for this game?" instantly and changes
+   nothing — exit 0 means nothing to do, exit 2 means work is pending. Use it before
+   committing to a run.
+
+   Option 7's auto-analysis takes **hours per binary** — start it detached (or overnight) and
+   do not interrupt it. Scope with `-OnlyGame <skyrim|f4|starfield|fnv>`; the other staged
+   binaries are moved aside for the run and restored afterwards.
 3. ```powershell
    .\setup\30-ghidra.ps1   # builds the MCP extension against BGS's managed Ghidra
    ```
