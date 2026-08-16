@@ -80,6 +80,21 @@ GUI mode (PluginTool not available)"*, the same GUI-only family as `/mcp/instanc
 the non-existent `/server_status`. Use the pipeline's import layout for program paths
 (`/f4/vr/Fallout4VR.exe.unpacked.exe`).
 
+## Starting the server is fast; you are not re-analysing anything
+
+Cold start with the full F4VR program (227,212 functions) opened from the project: **7.9 s**.
+A decompile round-trip after that is ~0.3 s. There is no "wait for it to load" phase to plan
+around — start it when you need it and stop it when you don't.
+
+The hours are all in **Phase 4's one-time analysis** (`35-ghidra-analysis.ps1`), which writes
+the database. `-Start -Project/-Program` only *opens* that database. The one exception is
+`-File <loose binary>`, which imports and runs auto-analysis on the spot — fine for a plugin
+DLL, wrong for a game EXE (stage those into the pipeline instead).
+
+Note the HTTP port is opened **after** the initial load, so a slow import is indistinguishable
+from a hang until it finishes; that is what `-TimeoutSec` is for (default 180 s, ~20x the
+measured project-open cost).
+
 ## `limit` is not honoured by the listing endpoints — this will blow up your context
 
 `GET /list_functions?limit=40` against F4VR returns **all 227,212 functions**: 12.2 MB, 19
