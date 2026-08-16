@@ -143,6 +143,45 @@ $pluginJar = Get-ChildItem (Join-Path $GhidraMcpDir 'build\libs') -Filter 'Ghidr
 if (-not $pluginJar) { throw 'No GhidraMCP-*.jar in build/libs - headless has nothing to run.' }
 
 # ---------------------------------------------------------------- deploy (GUI path only)
+# gradlew's `deploy` depends on a `stopGhidra` task that FORCE-KILLS every process whose
+# command line contains this install's path AND `ghidra.Ghidra`/`ghidraRun`. An
+# AnalyzeHeadless run from the enrichment pipeline matches both, so deploying while the
+# pipeline is analysing would destroy hours of work with no prompt. Refuse instead.
+# (The extension build above is safe -- it only writes into ghidra-mcp\build.)
+# Consider java/javaw AND python/pythonw: pyghidra embeds the JVM in the python process, so
+# BethesdaGhidraScripts' pipeline holds this install while no java.exe exists anywhere.
+# Filtering on the command line alone would also match the shell that invoked THIS script
+# (its own command line quotes the install path), so require a real JVM first.
+$busy = @(Get-Process -Name java, javaw, python, pythonw -ErrorAction SilentlyContinue | Where-Object {
+        $isJvm = $_.ProcessName -in 'java', 'javaw'
+        if (-not $isJvm) { try { $isJvm = [bool]($_.Modules | Where-Object ModuleName -eq 'jvm.dll') } catch { $isJvm = $false } }
+        if (-not $isJvm) { return $false }
+        # A JVM counts as "using this install" if it loaded a module from it, or names it.
+        $usesInstall = $false
+        try { $usesInstall = [bool]($_.Modules | Where-Object { $_.FileName -and $_.FileName.ToLower().StartsWith($ghidraHome.FullName.ToLower()) }) } catch {}
+        if (-not $usesInstall) {
+            $cl = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue).CommandLine
+            $usesInstall = $cl -and $cl.ToLower().Contains($ghidraHome.FullName.ToLower())
+        }
+        $usesInstall
+    } | ForEach-Object {
+        $cl = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue).CommandLine
+        [pscustomobject]@{ ProcessId = $_.Id; CommandLine = $(if ($cl) { $cl } else { $_.ProcessName }) }
+    })
+if ($busy.Count -and -not $HeadlessOnly) {
+    Write-Host ''
+    Write-Host 'REFUSING to deploy: something is running from this Ghidra install right now.'
+    foreach ($b in $busy) {
+        $short = $b.CommandLine.Substring(0, [Math]::Min(160, $b.CommandLine.Length))
+        Write-Host "  PID $($b.ProcessId): $short"
+    }
+    Write-Host '`gradlew deploy` would force-kill it (its stopGhidra task), and if that is an'
+    Write-Host 'AnalyzeHeadless run you would lose the analysis and be left with a stale project'
+    Write-Host 'lock. Wait for it to finish, then re-run. The extension jar is already built, so'
+    Write-Host 'you can use the headless server now with:  .\setup\30-ghidra.ps1 -HeadlessOnly'
+    exit 2
+}
+
 if ($HeadlessOnly) {
     Write-Host 'Skipping the GUI deploy (-HeadlessOnly).'
 }

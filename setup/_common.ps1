@@ -58,6 +58,63 @@ function Test-Cmd([string]$name) {
 
 <#
 .SYNOPSIS
+    Is a Ghidra project currently held? Returns $true when something owns its lock.
+
+.DESCRIPTION
+    Ghidra arbitrates a project with an OS file-channel lock on <name>.lock~ (the sibling
+    <name>.lock only carries hostname/user/timestamp metadata). So the ONLY reliable test is
+    whether that file can be opened exclusively -- try it and you get ground truth,
+    independent of which process holds it.
+
+    Do not test this by scanning for java.exe/javaw.exe. pyghidra embeds the JVM inside the
+    *python* process, so BethesdaGhidraScripts' own pipeline -- and any pyghidra-based MCP
+    server -- holds a project while no process named java exists anywhere on the machine.
+    A name-based scan reports "stale, safe to break" for a project that is very much in use.
+#>
+function Test-GhidraProjectLocked {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ProjectDir)
+
+    $channel = Get-ChildItem $ProjectDir -Filter '*.lock~' -Force -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $channel) { return $false }
+    try {
+        $fs = [IO.File]::Open($channel.FullName, 'Open', 'ReadWrite', 'None')
+        $fs.Close()
+        return $false
+    }
+    catch { return $true }
+}
+
+<#
+.SYNOPSIS
+    Best-effort description of the process holding a Ghidra project, for error messages.
+
+.DESCRIPTION
+    Considers java/javaw AND python/pythonw, because of the pyghidra case above; a python
+    process with jvm.dll loaded is a JVM. Naming the holder is advisory only -- authority
+    belongs to Test-GhidraProjectLocked.
+#>
+function Get-GhidraHolderDescription {
+    [CmdletBinding()]
+    param([string]$Hint = '')
+
+    foreach ($p in Get-Process -Name java, javaw, python, pythonw -ErrorAction SilentlyContinue) {
+        $isJvm = $p.ProcessName -in 'java', 'javaw'
+        if (-not $isJvm) {
+            try { $isJvm = [bool]($p.Modules | Where-Object ModuleName -eq 'jvm.dll') } catch { $isJvm = $false }
+        }
+        if (-not $isJvm) { continue }
+        $cmd = ''
+        try { $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)" -ErrorAction SilentlyContinue).CommandLine } catch {}
+        if ($Hint -and $cmd -and -not $cmd.ToLower().Contains($Hint.ToLower())) { continue }
+        $shown = if ($cmd) { $cmd.Substring(0, [Math]::Min(150, $cmd.Length)) } else { $p.ProcessName }
+        return "PID $($p.Id) ($($p.ProcessName), JVM): $shown"
+    }
+    return $null
+}
+
+<#
+.SYNOPSIS
     Run a native exe and judge it by its exit code, not by whether it wrote to stderr.
 
 .DESCRIPTION

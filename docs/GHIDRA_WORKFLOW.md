@@ -56,12 +56,29 @@ doesn't exist until the GUI has run once, so on a fresh machine: launch Ghidra o
 ## One writer at a time
 
 A Ghidra project is single-writer. The enrichment pipeline, a GUI, and the headless server all
-want the same lock, and the loser fails deep inside Ghidra with an unhelpful error.
-`36-ghidra-mcp.ps1` checks for `*.lock` first, names the holding process, and starts without a
-project rather than fighting. **Never delete a `.lock` while its holder is alive** — that
-corrupts the database. If a server is killed rather than stopped, the stale lock blocks every
-later run, which is why `-Stop` saves and shuts down over HTTP (`/save_all_programs`, then
-`/exit_ghidra`) instead of terminating the JVM.
+want the same lock, and the loser fails deep inside Ghidra with
+`LockException: Unable to lock project!` — after which the server is up and healthy with
+*nothing loaded*, so every tool call answers `No program loaded.`
+
+**Do not decide "is it in use?" by looking for `java.exe`.** pyghidra embeds the JVM inside
+the **python** process, so BethesdaGhidraScripts' pipeline — and any pyghidra-based MCP
+server — holds a project while no process named java exists on the machine. A name-based scan
+says "free" for a project that is very much in use, and acting on that is how databases get
+corrupted. Ghidra's actual mutual exclusion is an OS file-channel lock on `<name>.lock~`; the
+sibling `<name>.lock` is only hostname/user/timestamp metadata. So the test is simply *can I
+open `<name>.lock~` exclusively* — `Test-GhidraProjectLocked` in `setup/_common.ps1`.
+
+`36-ghidra-mcp.ps1` uses that, names the holder when it can, and starts without a project
+rather than fighting. It will break a **provably** stale `<name>.lock` (nothing holds
+`.lock~` *and* the lock names this host) so a crashed run doesn't need a human to delete a
+file nothing owns — but it never touches `.lock~`. And `-Stop` shuts down over HTTP
+(`/save_all_programs`, then `/exit_ghidra`) rather than killing the JVM, because a killed JVM
+is what leaves the stale lock in the first place.
+
+Note `/list_project_files` does **not** work headless — it answers *"Project listing requires
+GUI mode (PluginTool not available)"*, the same GUI-only family as `/mcp/instance_info` and
+the non-existent `/server_status`. Use the pipeline's import layout for program paths
+(`/f4/vr/Fallout4VR.exe.unpacked.exe`).
 
 ## The version gate
 

@@ -180,17 +180,42 @@ elseif (-not $Project) {
 # and forcing it risks the database. Detect it up front and say who has it.
 if ($Project) {
     $projDir = if ($Project.EndsWith('.gpr')) { Split-Path $Project -Parent } else { $Project }
-    $lock = Get-ChildItem $projDir -Filter '*.lock' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($lock) {
-        $holder = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -and ($_.CommandLine -match 'ghidra|pyghidra|bgs-analyze') } |
-            Select-Object -First 1
-        Write-Host "WARNING: $($lock.Name) exists - the project is held by another process."
-        if ($holder) { Write-Host "         likely holder: PID $($holder.ProcessId)  $($holder.CommandLine)" }
+
+    # Ground truth is the OS handle on <name>.lock~, not the presence of <name>.lock and not
+    # a scan for java.exe. See Test-GhidraProjectLocked: pyghidra runs the JVM inside
+    # python.exe, so the pipeline can hold a project while no java process exists at all.
+    if (Test-GhidraProjectLocked -ProjectDir $projDir) {
+        Write-Host 'WARNING: the project is LOCKED by another process right now.'
+        $who = Get-GhidraHolderDescription
+        if ($who) { Write-Host "         holder: $who" }
+        else { Write-Host '         (holder not identified - it may be a pyghidra/python process)' }
         Write-Host '         Starting the server WITHOUT a project. Re-run once it is free.'
-        Write-Host '         (Do not delete the lock while that process is alive - it will corrupt the database.)'
+        Write-Host '         Never delete the lock while it is held - that is how databases get corrupted.'
         $Project = ''
         $Program = ''
+    }
+    else {
+        # Not held. A leftover <name>.lock from a crash still makes Ghidra throw
+        # "LockException: Unable to lock project!", and leaving it needs a human to delete a
+        # file nothing owns -- exactly the manual step this script exists to remove.
+        $lock = Get-ChildItem $projDir -Filter '*.lock' -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notlike '*.lock~' } | Select-Object -First 1
+        if ($lock) {
+            $lockHost = (Get-Content $lock.FullName -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match '^Hostname=(.+)$' } | ForEach-Object { $Matches[1].Trim() } |
+                Select-Object -First 1)
+            if ($lockHost -and $lockHost -ne $env:COMPUTERNAME) {
+                Write-Host "WARNING: $($lock.Name) was taken by host '$lockHost', not this machine"
+                Write-Host "         ($env:COMPUTERNAME) - a shared project may be in use elsewhere."
+                Write-Host '         Leaving it alone and starting WITHOUT a project.'
+                $Project = ''
+                $Program = ''
+            }
+            else {
+                Write-Host "Breaking a stale lock: $($lock.Name) (nothing holds .lock~, host '$lockHost' is this machine)."
+                Remove-Item $lock.FullName -Force
+            }
+        }
     }
 }
 
@@ -270,8 +295,12 @@ if ($Program -or $File) {
     if (-not $meta.Ok -or $meta.Body -match 'No program loaded') {
         Write-Host "FAILED to load '$wanted'."
         Get-Content $outLog -Tail 20 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'Failed|Error|error' }
-        Write-Host 'The server is still running with no program. List what the project actually holds:'
-        Write-Host "  Invoke-RestMethod $baseUrl/list_project_files"
+        Write-Host 'The server is still running with no program.'
+        # NOT /list_project_files -- headless answers "Project listing requires GUI mode
+        # (PluginTool not available)". Same GUI-only family as /mcp/instance_info.
+        Write-Host 'A "LockException: Unable to lock project" above means something still holds it.'
+        Write-Host 'For the program path, use the folder layout the pipeline imported into, e.g.'
+        Write-Host '  /f4/vr/Fallout4VR.exe.unpacked.exe'
         exit 1
     }
     $flat = ($meta.Body -replace '\s+', ' ')
