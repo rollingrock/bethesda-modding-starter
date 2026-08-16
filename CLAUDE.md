@@ -269,16 +269,44 @@ it is the one part of Phase 5 an agent cannot self-verify.)
 ## Phase 6 — devbench (in-game instrumentation)
 
 Read `docs/DEVBENCH.md`, build the `fallout4` preset from `C:\repos\devbench`, deploy via
-`FalloutPluginTargets`, load a save, then:
+`FalloutPluginTargets`, then:
 
 ```powershell
 irm http://127.0.0.1:8930/api/health     # 8931 for VR
 ```
 
-**Gate:** health answers with the right game identity. NOTE (2026-08-15): this is a young
-fork — the Fallout target has never been live-tested; a failure here is findings, not user
-error. Report what happened to the user (and ideally upstream as an issue on
-rollingrock/devbench).
+**Gate:** health answers `ok:true` with the right game identity, and `frame` rises between two
+calls (that is what separates "rendering" from "stuck at init").
+
+**You can run this yourself — a VR game does not need a headset.** SteamVR's null driver
+presents a synthetic HMD, so the game initialises, loads F4SE plugins and renders frames with
+nothing plugged in. It is how Phase 6 was verified on this machine:
+
+```powershell
+& C:\repos\modlist-agent\core\tools\steamvr-null.ps1 -Enable
+& "C:\Modding\mo2_fo4vr_gen\ModOrganizer.exe" -p Default "moshortcut://:F4SEVR"
+# ... test against 127.0.0.1:8931 ...
+& C:\repos\modlist-agent\core\tools\steamvr-null.ps1 -Disable
+```
+
+**`-Disable` on every path, including failure.** The setting is GLOBAL: left enabled it forces
+the null HMD even when a real headset is plugged in. Close SteamVR before toggling — the
+script refuses while `vrserver`/`vrmonitor` run, because the change would be both ignored and
+overwritten on exit. Expect the first-ever headless launch to be eaten by SteamVR room setup.
+
+Launch **through MO2**, never from Steam: the mods only exist inside MO2's virtual filesystem,
+so a Steam launch is silently vanilla. MO2 executable titles must not contain spaces —
+`moshortcut://` arguments get whitespace-split by callers.
+
+Verified live on FO4VR 1.2.72 (2026-08-16): all 7 tools answer; `rendertarget list` returns
+95 targets at 3024x1680 R11G11B10_FLOAT; `measure` reports 135 fps / p99 18.2 ms. See
+`docs/DEVBENCH.md` for the full table. Two things that cost real time to learn:
+
+- **The server binds at `kPostLoad`, not `kGameDataReady`.** On F4SEVR that message arrives
+  ~7 s late and on some installs never — a server bound to it never starts at all.
+- **A save is needed for the TOOLS, not for the server.** At the main menu anything needing a
+  main-thread task returns a 504 saying the frame counter has not advanced. That is the
+  instrument being honest; load a save before calling `inspect`/`console`/`rendertarget`.
 
 ## Final verification
 
