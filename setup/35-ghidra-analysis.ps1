@@ -67,6 +67,8 @@ $ghidraDir   = Join-Path $BgsRoot 'tools\ghidra'
 # enrichment back while leaving a multi-hundred-MB project behind. Nothing on disk
 # distinguishes "enriched" from "imported then rolled back", so record our own verdict.
 $markerPath  = Join-Path $BgsRoot '.analysis-verified.json'
+$ProjectName = 'BethesdaGhidraScripts'
+$projectRoot = Join-Path $BgsRoot "ghidraprojects\$ProjectName"
 
 # ---- What is staged? (mirrors BGS's own _discover_exes: exes\<game>\<ver>\*.exe) ----
 $staged = @()
@@ -214,24 +216,31 @@ try {
     # ---- Drive the menu ----
     # PowerShell has no stdin redirect for native commands, so hand the key sequence to cmd.
     # A trailing 'q' leaves the menu cleanly; run.py also treats EOF as quit.
-    $keyFile = Join-Path $env:TEMP ("bgs-keys-" + [Guid]::NewGuid().ToString('N') + ".txt")
-    Set-Content $keyFile (($steps + 'q') -join "`n") -Encoding ascii
+    # run.py ships proper subcommands for the main path -- `setup` (menu 1+2), `build`
+    # (menu 7), `all`, `clean` -- so use those rather than feeding menu keys. Only the
+    # improve pass (menu 9) has no subcommand and still needs stdin.
+    $subcommands = @()
+    if (($steps -contains '1') -or ($steps -contains '2')) { $subcommands += 'setup' }
+    if ($steps -contains '7') { $subcommands += 'build' }
     Write-Host ''
-    Write-Host ("  Driving run.py with: " + (($steps + 'q') -join ' ') + "  (this is the slow part)")
+    Write-Host ("  run.py subcommands: " + ($subcommands -join ', ') + "  (this is the slow part)")
     Write-Host ''
 
     $runLog = Join-Path $env:TEMP ("bgs-run-" + [Guid]::NewGuid().ToString('N') + ".log")
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    $rc = 0
     Push-Location $BgsRoot
     try {
-        & cmd /c "python run.py < `"$keyFile`"" 2>&1 | Tee-Object -FilePath $runLog
-        $rc = $LASTEXITCODE
+        foreach ($sub in $subcommands) {
+            Write-Host "  -> python run.py $sub"
+            & python run.py $sub 2>&1 | Tee-Object -FilePath $runLog -Append
+            if ($LASTEXITCODE -ne 0) { $rc = $LASTEXITCODE; break }
+        }
     }
     finally {
         Pop-Location
         $ErrorActionPreference = $prevEap
-        Remove-Item $keyFile -Force -ErrorAction SilentlyContinue
     }
 
     Write-Host ''
@@ -344,6 +353,33 @@ if (-not $SkipImprove) {
             if (-not $named) { Write-Warning "      no naming summary from the improve pass for $($t.Path)" }
         }
     }
+}
+
+# ---- Export symbols (this is what Phase 5 consumes) ----
+# scripts/core/symbol_export.py is scriptable and turns the named project into a .dd64
+# x64dbg database, a .map, and a full .symbols.json with prototypes. Menu 10 wraps the same
+# code behind prompts. Without this the analysis stays locked inside Ghidra.
+if (-not $SkipImprove -and $programs -and $programs.Count) {
+    $symRoot = Join-Path $BgsRoot 'symbols'
+    Write-Host ''
+    Write-Host '  Exporting symbols (.dd64 for x64dbg, .map, .symbols.json) ...'
+    foreach ($t in $targets) {
+        $leaf = ($t.Path -split '/')[-1] -replace '\.unpacked\.exe$', '.exe'
+        $slug = ($t.Path.Trim('/') -replace '/', '-') -replace '\.exe.*$', ''
+        $outDir = Join-Path $symRoot $slug
+        New-Item -ItemType Directory -Force $outDir | Out-Null
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        Push-Location $BgsRoot
+        try {
+            & python scripts\core\symbol_export.py $projectRoot $ProjectName $t.Path $outDir `
+                --module $leaf --signatures 2>&1 |
+                Where-Object { $_ -match 'functions:|wrote:|ERROR|Error' } |
+                ForEach-Object { Write-Host ("      " + $_) }
+        }
+        finally { Pop-Location; $ErrorActionPreference = $prevEap }
+    }
+    Write-Host ("    symbols under $symRoot")
 }
 
 Write-Host ''

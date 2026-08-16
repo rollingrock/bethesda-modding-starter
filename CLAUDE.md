@@ -105,6 +105,29 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    nothing — exit 0 means nothing to do, exit 2 means work is pending. Use it before
    committing to a run.
 
+   **Use run.py's subcommands, not the menu.** `python run.py setup` (menu 1+2), `build`
+   (menu 7), `all`, `clean` are documented under "Non-interactive mode" and need no stdin at
+   all. Only the improve pass (menu 9) has no subcommand. `run clean` before rebuilding if the
+   project records a different importer stage, or stale names survive.
+
+   **Export the symbols when the analysis is done** — `scripts/core/symbol_export.py` is
+   scriptable (menu 10 wraps it) and is what makes Phase 5 work: it emits a `.dd64` x64dbg
+   database, a `.map`, and a `.symbols.json` with prototypes. Measured on F4VR: 60,615
+   functions, 60,671 x64dbg labels. Without it the analysis stays locked inside Ghidra.
+   `35-ghidra-analysis.ps1` runs it into `<bgs>\symbols\<game>-<ver>\`.
+
+   **The improvement drivers do nothing for F4VR** — measured, not assumed.
+   `string_anchored_rename` renamed 0 (release build, no self-identifying debug strings),
+   `console_harvest` found no command table, `settings_harvest` 0 candidates,
+   `pe_unwind_enrich` and `registration_harvest` changed nothing. Named-function count was
+   byte-identical before and after all five. They are documented as being for "where CommonLib
+   is thin (newer builds, Starfield, FNV)" — F4VR's gap is a *naming-source* gap, not a type
+   gap. Worth trying on Starfield; do not spend time on them for Fallout 4 VR.
+   Their multi-program runner `discover_combined.py` is also broken on Windows: it calls
+   `getExecutablePath()` raw instead of the `_program_executable_path()` normalizer that sits
+   beside it, so Ghidra's `/C:/...` form becomes `C:\C:\...` and every program fails identity
+   verification. `apply_enrichment_to_user_project.py` (one driver, one program) is correct.
+
    Option 7's auto-analysis takes **hours per binary** — start it detached (or overnight) and
    do not interrupt it. Scope with `-OnlyGame <skyrim|f4|starfield|fnv>`; the other staged
    binaries are moved aside for the run and restored afterwards.
