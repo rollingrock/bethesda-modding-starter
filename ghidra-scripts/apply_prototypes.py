@@ -600,6 +600,12 @@ def phase_apply(args) -> None:
                         "calling_convention": args.calling_convention,
                     }, timeout=120)
                     journal.write(json.dumps({**row, "result": json.loads(res)}) + "\n")
+                    # Flush every line. The journal is the ONLY record of what was written
+                    # to the database, so buffering it means a crash loses exactly the
+                    # information needed to know how far the run got -- which is the one
+                    # job it has. Observed: default buffering held ~280 entries back.
+                    journal.flush()
+                    os.fsync(journal.fileno())
                 except Exception as exc:               # noqa: BLE001
                     failed += 1
             if (i + 1) % 250 == 0:
