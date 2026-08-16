@@ -42,6 +42,71 @@ Only entries with `status >= 3` (high confidence) are applied.
 - Run it from the Script Manager (`Window > Script Manager`) with your game program open
   **after auto-analysis has completed**.
 
+## `apply_prototypes.py` — turn the signature in a NAME into an applied prototype
+
+The name import above sets names only, so the decompiler still shows
+`(undefined4 *param_1, longlong param_2, ...)` even though the name says
+`Allocate(NiPoint3&,TESObjectCELL*,TESWorldSpace*,float,float)`. This parses those names
+and applies them with `/set_function_prototype`. It talks HTTP to the **headless** MCP
+server (`setup/36-ghidra-mcp.ps1 -Start`); no pyghidra, no GUI.
+
+```powershell
+python apply_prototypes.py fetch                       # ~20 s
+python apply_prototypes.py probe --only-resolvable     # SLOW, resumable (see below)
+python apply_prototypes.py report                      # tiers + writes plan.json
+python apply_prototypes.py apply                       # DRY RUN: validates, writes nothing
+python apply_prototypes.py apply --tier 1 --apply      # commits
+```
+
+**Back up the project first.** This writes to a database that took hours to build. Every
+applied change is journalled to `.proto-cache/journal.jsonl`.
+
+### Why it is more than a string substitution
+
+A demangled C++ name is missing two things, and both will bite:
+
+- **No `this`.** Prepending one when the method is static shifts every parameter by one —
+  strictly worse than leaving the function alone. Nothing in the source data records
+  static vs instance (the address-library CSV is `id,fo4,vr,status,name`; BGS's PDB
+  publics corpus is already demangled with no access specifiers). The only local signal is
+  Ghidra's decompiler arity, which can undercount but never overcount, so `inferred ==
+  args+1` proves a `this` and `inferred == args` is genuinely ambiguous. Measured on 150
+  functions: **67% decisive, 26% ambiguous**. The ambiguous ones are skipped, not guessed.
+- **No return type.** Emitting `void` would destroy the decompiler's own inference, so
+  every prototype returns `undefined8` — Ghidra's honest "unknown 8 bytes".
+
+### Most of the type inventory is unusable, which is the real limit
+
+The program reports ~45,700 data types, but that number is misleading:
+**32,182 have template arguments in their name and 27,813 of those are 1-byte stubs.**
+`NiPointer`, `BSTSmartPointer`, `CArgs` and `StreamRequest` are all 1 byte. Pointing a
+parameter at one makes the decompiler confidently misreport field offsets — worse than
+leaving it undefined. Worse still, bare leaf names are ambiguous: **four unrelated types
+in this program are called `Entry`.**
+
+So resolution is strict by default — a type must match verbatim and not be a stub.
+Measured across all 25,867 signature-carrying functions:
+
+| | args |
+|---|---|
+| exact type match | 14,194 |
+| builtin (int/float/bool/...) | 10,443 |
+| **unresolved** | **22,670** |
+
+Unresolved parameters become `void *` in Tier 2 rather than a wrong struct. `--loose`
+relaxes this to accept a template's base name; it is off by default for the reasons above.
+
+The unresolved set clusters tightly — Havok (`hkbInternal`, `hkQsTransformf`, `hkaSkeleton`)
+and Bethesda containers CommonLibF4 does not model. Importing Havok types is the single
+biggest lever for raising Tier 1.
+
+### Gotcha found the hard way
+
+`/decompile_function?functions=` **silently caps a batch at 20**. Ask for 25 and exactly 20
+come back, tail dropped, no error, nothing in the endpoint's description. The probe phase
+detects short responses and re-fetches the remainder individually, so a future change to
+the cap costs speed rather than coverage.
+
 ### Tip for agents
 
 Anything shaped "for each X in the program, tell me Y" should be a single

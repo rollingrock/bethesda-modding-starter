@@ -15,3 +15,6 @@ setup/.analysis-verified.json
 # Python bytecode (probe_bridge.py is run directly; nothing here should be committed)
 __pycache__/
 *.pyc
+
+# apply_prototypes.py working cache (per-machine: absolute paths, addresses, journals)
+ghidra-scripts/.proto-cache/
