@@ -119,11 +119,39 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    of 216,903 (+34,494), and the changes are *saved*, not rolled back. `35-ghidra-analysis.ps1`
    runs it automatically after option 7 (`-SkipImprove` opts out).
 
-   Staging a flat Fallout 4 (`exes\f4\ae\Fallout4.exe`, or `\ng\`) is still worth doing but is
-   an *upgrade*, not a prerequisite: it anchors the cross-version byte-signature port, which
-   adds real CommonLib function names on top of the RTTI-derived ones. `exes\f4\221\` further
-   unlocks a 38k-record community PDB-publics corpus, which is identity-bound by SHA-256 — the
-   corpus is silently skipped (`PDB publics: 0 loaded`) unless that exact binary is staged.
+   **Which flat build you stage matters, and 1.11.221 is not the one for VR.** Measured here:
+
+   | Staged | Result |
+   |---|---|
+   | `f4\vr` only | VR: 13 named by option 7 (rolled back) → **34,507** after the improve pass |
+   | `+ f4\221` | 221 itself: **31,040 scoped `Class::Fn`** names. VR: **no change** |
+
+   The auto-run porter (`run_bytesig_port.py`) anchors only at AE or NG — literally
+   `for cand in ("ae", "ng")` — so a 221 binary never triggers it. Forcing the other porter
+   (`bytesig_port_combined.py --source 221`, which BGS documents as "the richest PDB pool")
+   ported **1 function out of 12,240**: exact 32-byte pass matched once, the masked 48-byte
+   retry matched nothing. 1.11.221 and VR 1.2.72 are too far apart to share function bodies.
+   BGS ships vtable-slot shift maps for `vr_to_ae` and `vr_to_ng` and none for 221, which is
+   the same conclusion from the other direction.
+
+   So: stage **`exes\f4\ae\Fallout4.exe` (1.11.191)** or **`\ng\` (1.10.984)** if you want real
+   CommonLib names on VR. `exes\f4\221\` is still worth staging — it is what unlocks the
+   38k-record PDB-publics corpus and it names the flat binary well — but it does nothing for
+   VR. Without an AE/NG binary the RTTI walk's ~34.5k is the realistic ceiling for F4VR.
+
+   Two traps that make the corpus look absent when it is not:
+   - **`PDB publics: 0 loaded`** — the corpus is identity-bound by SHA-256 to one exact
+     `Fallout4.exe`. It is skipped silently unless that binary is staged.
+   - **Git mangles the corpus on Windows.** `f4_221_pdb_publics.txt` is a byte-exact artifact
+     with no `.gitattributes` protection, so `core.autocrlf=true` (the Git-for-Windows default)
+     rewrites its line endings on checkout and its hash stops matching — the validator then
+     raises `ValueError: F4 221 PDB-public dump changed after binding` and kills the whole run
+     with a traceback. Fix by converting it back to LF (3,939,250 → 3,901,215 bytes, sha256
+     `ab927b7d…`) and pinning it with `-text` in `.git/info/attributes`.
+   - **clang is resolved as a bare `clang` on PATH**, but BGS installs it to `tools\llvm\bin`.
+     Menu 1 mutates PATH only inside its own process, so every later run prints
+     `Clang: not installed` and **silently skips script generation** — the run then imports
+     binaries and ports nothing, with no error. `35-ghidra-analysis.ps1` puts it on PATH.
 
    **Do not treat the `.gpr` as proof of success.** Ghidra creates the project and imports the
    binary *before* enrichment runs, and `run.py` exits 0 even when verification fails and rolls

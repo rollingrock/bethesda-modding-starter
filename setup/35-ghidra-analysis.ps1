@@ -48,6 +48,17 @@ if (-not (Test-Path $BgsRoot)) {
     throw "BethesdaGhidraScripts not found at $BgsRoot. Run setup\20-repos.ps1 first."
 }
 
+# BGS installs clang to tools\llvm\bin but resolves it as a bare "clang" on PATH
+# (run.py's _clang_version() takes no executable for the status panel and for script
+# generation). Menu 1 only appears to work because it checks the explicit path and mutates
+# PATH inside that one process; a later process sees no clang, prints "Clang: not installed",
+# and SILENTLY SKIPS generating the import scripts -- the run then imports binaries and ports
+# nothing, with no error. Put it on PATH for every child process we spawn.
+$llvmBin = Join-Path $BgsRoot 'tools\llvm\bin'
+if ((Test-Path (Join-Path $llvmBin 'clang.exe')) -and ($env:PATH -notlike "*$llvmBin*")) {
+    $env:PATH = "$llvmBin;$env:PATH"
+}
+
 $exesRoot    = Join-Path $BgsRoot 'exes'
 $projectGpr  = Join-Path $BgsRoot 'ghidraprojects\BethesdaGhidraScripts\BethesdaGhidraScripts.gpr'
 $ghidraDir   = Join-Path $BgsRoot 'tools\ghidra'
@@ -236,6 +247,20 @@ try {
         Where-Object { $_ -match 'VERIFICATION FAILURES|post-import verification failed|^\s*FAILURES:' })
     $script:rolledBack = @($runOut | Where-Object { $_ -match 'changes were rolled back' })
     $script:namedLow   = @($runOut | Where-Object { $_ -match 'Named functions too low' })
+
+    # run.py can also die outright -- a step raising inside generate_scripts kills the whole
+    # menu with a Python traceback, long before any import or verification happens. That
+    # leaves none of the markers above, so without this an aborted run reads as a clean pass.
+    $script:crashed = @($runOut | Where-Object { $_ -match 'Traceback \(most recent call last\)|^\s*\w+Error: ' })
+    if ($crashed.Count) {
+        Write-Host ''
+        Write-Warning 'run.py aborted with a Python traceback; the pipeline did not complete.'
+        foreach ($l in @($runOut | Where-Object { $_ -match '^\s*\w+(Error|Exception): ' } | Select-Object -Last 3)) {
+            Write-Host ("    $($l.Trim())")
+        }
+        Write-Host '    Nothing was verified. Fix the error above and re-run.'
+        exit 1
+    }
 }
 finally {
     Restore-HeldExes
