@@ -15,9 +15,12 @@
       commonlibsf        libxse/commonlibsf — Starfield CommonLib (xmake-based).
       vr_address_tools   alandtse/vr_address_tools + the two VR address-library submodules
                          (Skyrim VR + Fallout 4 VR offset CSVs). LARGE (~1.1 GB cloned).
-      devbench           rollingrock/devbench, branch feat/multigame-core — in-game query
-                         server (MCP+REST on loopback) for Skyrim (SKSE/xmake) and
-                         Fallout 4 / FO4VR (F4SE/CMake). See docs/DEVBENCH.md.
+      devbench           rollingrock/devbench (main) — in-game query server (MCP+REST on
+                         loopback) for Skyrim (SKSE/xmake) and Fallout 4 / FO4VR
+                         (F4SE/CMake). See docs/DEVBENCH.md.
+      modlist-agent      rollingrock/modlist-agent — reproducible MO2 instance builder, and
+                         the SteamVR null-driver toggle Phase 6 uses to run a VR game with
+                         no headset attached.
       ghidra-mcp         bethington/ghidra-mcp — Ghidra MCP bridge + extension source.
                          Installed by setup/30-ghidra.ps1.
       BethesdaGhidraScripts
@@ -43,9 +46,18 @@ if (-not (Test-Path $Root)) { New-Item -ItemType Directory -Force $Root | Out-Nu
 $repos = @(
     @{ Name = 'CommonLibF4';  Url = 'https://github.com/alandtse/CommonLibF4.git';      Args = @() }
     @{ Name = 'commonlibsf';  Url = 'https://github.com/libxse/commonlibsf.git';        Args = @('--recurse-submodules') }
-    @{ Name = 'devbench';     Url = 'https://github.com/rollingrock/devbench.git';      Args = @('--branch', 'feat/multigame-core', '--recurse-submodules') }
+    # devbench: MAIN, not feat/multigame-core. That branch stopped at 82cbdb2 and is missing
+    # df37963, which moves the Fallout server's startup from kGameDataReady to kPostLoad --
+    # without it the server never starts on F4SEVR and :8931 is simply closed. Cloning the
+    # branch handed a fresh machine the broken build while the docs said Phase 6 worked.
+    @{ Name = 'devbench';     Url = 'https://github.com/rollingrock/devbench.git';      Args = @('--recurse-submodules') }
     @{ Name = 'ghidra-mcp';   Url = 'https://github.com/bethington/ghidra-mcp.git';     Args = @() }
     @{ Name = 'BethesdaGhidraScripts'; Url = 'https://github.com/1001Bits/BethesdaGhidraScripts.git'; Args = @() }
+    # modlist-agent: builds the MO2 instance Phase 6 runs against, and ships
+    # core/tools/steamvr-null.ps1 -- the SteamVR null driver toggle that lets a VR game boot
+    # and load its plugins with no headset attached. That is what makes Phase 6 something an
+    # agent can run rather than hand back to the user. CLAUDE.md references it by path.
+    @{ Name = 'modlist-agent'; Url = 'https://github.com/rollingrock/modlist-agent.git'; Args = @() }
 )
 if (-not $SkipAddressTools) {
     $repos += @{ Name = 'vr_address_tools'; Url = 'https://github.com/alandtse/vr_address_tools.git'; Args = @('--recurse-submodules') }

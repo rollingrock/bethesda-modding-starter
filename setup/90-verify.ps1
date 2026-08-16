@@ -69,8 +69,18 @@ if (-not $vcpkgRoot) { $vcpkgRoot = [Environment]::GetEnvironmentVariable('VCPKG
 if ($vcpkgRoot) { Check 'env' 'vcpkg bootstrapped' (Test-Path (Join-Path $vcpkgRoot 'vcpkg.exe')) }
 
 # repos
-foreach ($r in 'CommonLibF4', 'commonlibsf', 'devbench', 'ghidra-mcp') {
+foreach ($r in 'CommonLibF4', 'commonlibsf', 'devbench', 'ghidra-mcp', 'modlist-agent') {
     Check 'repos' $r (Test-Path (Join-Path $Root "$r\.git"))
+}
+# devbench must be on main: the feat/multigame-core branch predates the fix that starts the
+# Fallout server at kPostLoad, and without it :8931 never opens (Phase 6 silently fails).
+$devbench = Join-Path $Root 'devbench'
+if (Test-Path (Join-Path $devbench '.git')) {
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $branch = (& git -C $devbench rev-parse --abbrev-ref HEAD 2>$null)
+    $hasFix = (& git -C $devbench log --oneline -1 --grep 'kPostLoad' 2>$null)
+    $ErrorActionPreference = $prev
+    Check 'repos' 'devbench has the kPostLoad fix' ([bool]$hasFix) "branch=$branch"
 }
 Check 'repos' 'vr_address_tools (optional)' (Test-Path (Join-Path $Root 'vr_address_tools\.git'))
 
