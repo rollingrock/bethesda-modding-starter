@@ -26,7 +26,8 @@ machine up"**. Everything also works by hand — the setup scripts are ordinary 
 - **`docs/`** — the per-game stack matrix (which CommonLib/address library per game), the
   Ghidra MCP workflow, and the devbench guide.
 - **`mcp/mcp.template.json`** — drop-in `.mcp.json` giving any project's Claude sessions
-  Ghidra + x64dbg access (the scaffolder installs it automatically).
+  Ghidra + x64dbg access (the scaffolder installs it automatically;
+  `36-ghidra-mcp.ps1 -WriteMcpConfigTo <dir>` generates it with paths resolved).
 - **`ghidra-scripts/`** — bulk address-library name import for Ghidra.
 
 ## Quick start (fresh machine)
@@ -38,7 +39,9 @@ cd C:\repos\bethesda-modding-starter
 .\setup\00-prereqs.ps1        # toolchain via winget
 .\setup\10-vcpkg.ps1          # vcpkg + BOTH env vars the chain reads
 .\setup\20-repos.ps1          # CommonLibs, devbench, ghidra-mcp, address libraries
-.\setup\30-ghidra.ps1         # Ghidra + MCP extension + bridge (version-matched)
+.\setup\30-ghidra.ps1         # GhidraMCP extension + bridge, built for YOUR Ghidra version
+.\setup\35-ghidra-analysis.ps1     # the enriched analysis database (hours; -CheckOnly first)
+.\setup\36-ghidra-mcp.ps1 -Start   # headless MCP server — no GUI, no clicks
 .\setup\40-x64dbg.ps1         # x64dbg + MCP plugin (version-pinned)
 .\setup\90-verify.ps1 -BuildTest   # proves it: scaffolds and builds a real plugin
 ```

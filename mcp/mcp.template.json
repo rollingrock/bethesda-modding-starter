@@ -1,11 +1,13 @@
 {
+  "_comment": "Copy to <your project>\\.mcp.json. setup/36-ghidra-mcp.ps1 -WriteMcpConfigTo <dir> generates this for you with the paths already resolved. GHIDRA_MCP_URL is REQUIRED for the headless server: bridge discovery probes /mcp/instance_info, which only the Ghidra GUI plugin serves, so without this pin list_instances() finds nothing and no tools register. Drop it only if you are using the GUI.",
   "mcpServers": {
     "ghidra": {
       "type": "stdio",
       "command": "C:/repos/ghidra-mcp/.venv/Scripts/bridge-mcp-ghidra.exe",
       "args": [],
       "env": {
-        "PYTHONIOENCODING": "utf-8"
+        "PYTHONIOENCODING": "utf-8",
+        "GHIDRA_MCP_URL": "http://127.0.0.1:8089"
       }
     },
     "x64dbg": {

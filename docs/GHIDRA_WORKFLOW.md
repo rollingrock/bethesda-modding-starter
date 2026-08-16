@@ -4,19 +4,37 @@ How to drive Ghidra from a Claude Code session via the `ghidra` MCP entry
 ([bethington/ghidra-mcp](https://github.com/bethington/ghidra-mcp)). Distilled from months of
 Skyrim VR + Fallout 4 VR reverse-engineering; every rule below was earned the hard way.
 
-## Architecture
+## Architecture — two servers, pick one
 
 ```
-Claude Code ── stdio ──> bridge-mcp-ghidra.exe ── HTTP :8089 ──> GhidraMCP extension (in the Ghidra GUI)
+HEADLESS (default; no GUI, agent-drivable end to end)
+Claude Code ─stdio─> bridge-mcp-ghidra.exe ─HTTP :8089─> GhidraMCPHeadlessServer (java, windowless)
+
+GUI (only when you want to LOOK at the disassembly)
+Claude Code ─stdio─> bridge-mcp-ghidra.exe ─HTTP :8089─> GhidraMCP extension (inside the Ghidra GUI)
 ```
 
-- **The Ghidra GUI must be running** with your program open and `Tools > GhidraMCP > Start MCP
-  Server` clicked. No GUI = no analysis tools.
-- The bridge discovers running Ghidra instances via socket files in
-  `%TEMP%\ghidra-mcp-<user>\` — stale files from crashed sessions show up as dead entries in
-  `list_instances()`; ignore or delete them.
+`setup/36-ghidra-mcp.ps1 -Start` runs the headless one. Measured on a clean machine: up in
+~5 s, 226 REST endpoints, bridge registers 225 MCP tools. It is a `GhidraLaunchable`, not a
+fat jar — `java -jar` cannot work, because the build deliberately leaves the Ghidra jars out
+("provided by Ghidra at runtime"). The launcher builds a ~194-jar classpath into a java
+`@argfile`; `30-ghidra.ps1` writes it.
 
-## The connect ritual (every session, no exceptions)
+## Connecting
+
+**Headless: there is no connect ritual. Just use the tools.** The bridge auto-connects over
+TCP using `GHIDRA_MCP_URL` (the generated `.mcp.json` pins `http://127.0.0.1:8089`) and
+registers everything at startup.
+
+**`list_instances()` returns `[]` against a headless server. That is expected.** Discovery
+probes `/mcp/instance_info`, an endpoint only the GUI plugin registers (`ServerManager.java`,
+`GhidraMCPPlugin.java`). Headless doesn't serve it, so the 8089..8104 scan finds nothing and
+`connect_instance()` has nothing to match. It *does* serve `/mcp/schema`, which is all the
+TCP fallback needs. If you reach for `list_instances()` first out of habit and get an empty
+list, **you are connected anyway** — check with any real tool, or
+`36-ghidra-mcp.ps1 -Status`.
+
+**GUI: the connect ritual still applies, in this order:**
 
 ```
 list_instances()                 # ALWAYS first
@@ -24,19 +42,37 @@ connect_instance("<your project>")
 list_open_programs()
 ```
 
-Before `connect_instance`, only ~30 static tools exist. The ~200 analysis tools
-(`decompile_function`, `search_functions`, …) register only after connecting. **If
-`decompile_function` "doesn't exist", you skipped the connect.** And if more than one Ghidra
-runs on the machine, an un-connected bridge can silently read the WRONG binary and return
-confident nonsense. If one instance has multiple programs open, pass `program=` on every call
-(or set `GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS=1` for the bridge).
+Before `connect_instance`, only ~30 static tools exist; the ~200 analysis tools register on
+connect. **If `decompile_function` "doesn't exist", you skipped the connect.** With more than
+one Ghidra on the machine, an un-connected bridge can silently read the WRONG binary and
+return confident nonsense. If one instance has several programs open, pass `program=` on
+every call (or set `GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS=1`).
+
+The GUI plugin starts its HTTP server automatically when the plugin loads — but it only loads
+if `FrontEndTool.xml` names it, and `gradlew deploy`'s patch step can't create that file. It
+doesn't exist until the GUI has run once, so on a fresh machine: launch Ghidra once, re-run
+`setup/30-ghidra.ps1`, and subsequent launches auto-start the server.
+
+## One writer at a time
+
+A Ghidra project is single-writer. The enrichment pipeline, a GUI, and the headless server all
+want the same lock, and the loser fails deep inside Ghidra with an unhelpful error.
+`36-ghidra-mcp.ps1` checks for `*.lock` first, names the holding process, and starts without a
+project rather than fighting. **Never delete a `.lock` while its holder is alive** — that
+corrupts the database. If a server is killed rather than stopped, the stale lock blocks every
+later run, which is why `-Stop` saves and shuts down over HTTP (`/save_all_programs`, then
+`/exit_ghidra`) instead of terminating the JVM.
 
 ## The version gate
 
 The GhidraMCP extension only loads in the exact Ghidra version it was built for
 (`extension.properties` version == Ghidra's `application.version`). `setup/30-ghidra.ps1`
-enforces this by downloading the stock Ghidra release matching ghidra-mcp's `pom.xml`. If you
-upgrade Ghidra, rebuild + redeploy the extension (`python -m tools.setup build` / `deploy`).
+builds **against whatever install you actually have** (`gradlew -PGHIDRA_INSTALL_DIR=…`, which
+stamps the version at `processResources` time) and then re-reads the stamp out of the built
+zip to prove it matches before deploying. Note ghidra-mcp's `pom.xml` names a different
+version (12.1.2 at time of writing) — that is only a default, and `gradlew verifyVersion` will
+fail on the mismatch even though the build itself is fine. If you upgrade Ghidra, re-run
+`30-ghidra.ps1`.
 Also: **never let a newer Ghidra upgrade an existing project unattended** — project upgrades
 are one-way and analysis databases for game binaries are hours of work to rebuild.
 
@@ -89,7 +125,12 @@ Auto-analysis takes hours per Bethesda binary; let it finish. Afterwards:
 
 `setup/30-ghidra.ps1` builds the GhidraMCP extension **against BGS's managed Ghidra**
 (`tools/ghidra` inside the repo) when present, so one Ghidra serves both the pipeline and the
-MCP bridge. Back up the project directory before any mass-modifying script.
+MCP bridge — and so the MCP server can open the very project the pipeline produced. Back up
+the project directory before any mass-modifying script.
+
+Because both halves share one Ghidra they also share one project lock: **do not run
+`35-ghidra-analysis.ps1` and `36-ghidra-mcp.ps1 -Project` at the same time.** Analysis wins
+(it is the long job); point the MCP server at the project once analysis is done.
 
 **Fork note (verified 2026-08-15):** `alandtse/BethesdaGhidraScripts` is a fork **of
 1001Bits** (not a sibling — 1001Bits itself forks doodlum), and the two have diverged:

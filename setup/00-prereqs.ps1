@@ -9,19 +9,26 @@
 
     Installs via winget:
       Git, CMake, Visual Studio 2022 Community (+ Desktop C++ workload), Python 3.12,
-      Temurin JDK 21 (Ghidra), Apache Maven (builds the GhidraMCP extension),
-      Node.js LTS (x64dbg MCP server), PowerShell 7, GitHub CLI.
+      Temurin JDK 21 (Ghidra + the GhidraMCP build), Node.js LTS (x64dbg MCP server),
+      GitHub CLI.
+
+    Not required, deliberately:
+      * Maven — winget has no such package, and 30-ghidra.ps1 uses gradlew.bat instead.
+      * PowerShell 7 — every script here is Windows PowerShell 5.1 compatible on purpose,
+        because 5.1 is what a fresh Windows box and `shell: powershell` in CI both run.
 #>
 [CmdletBinding()]
 param(
     [switch]$CheckOnly
 )
 
-$results = [System.Collections.Generic.List[object]]::new()
+. "$PSScriptRoot\_common.ps1"
 
-function Test-Cmd([string]$name) {
-    try { $null = Get-Command $name -ErrorAction Stop; $true } catch { $false }
-}
+# Pick up anything installed since this shell started (see Sync-Path) — otherwise a tool
+# winget already installed reads as MISSING and we try to install it a second time.
+Sync-Path
+
+$results = [System.Collections.Generic.List[object]]::new()
 
 function Ensure-Winget([string]$display, [string]$id, [scriptblock]$check, [string]$override = '') {
     $present = & $check
@@ -38,7 +45,14 @@ function Ensure-Winget([string]$display, [string]$id, [scriptblock]$check, [stri
     if ($override) { $wingetArgs += @('--override', $override) }
     & winget @wingetArgs
     $ok = ($LASTEXITCODE -eq 0)
-    $results.Add([pscustomobject]@{ Component = $display; Status = $(if ($ok) { 'installed' } else { 'FAILED' }); Action = "winget $id" })
+    # winget put the new bin dir in the registry PATH; make it usable in THIS process so
+    # the check below (and every later script) sees it without a new terminal.
+    Sync-Path
+    $visible = & $check
+    $status = if ($visible) { 'installed' }
+    elseif ($ok) { 'installed (new shell needed)' }
+    else { 'FAILED' }
+    $results.Add([pscustomobject]@{ Component = $display; Status = $status; Action = "winget $id" })
 }
 
 if (-not (Test-Cmd 'winget')) {
@@ -51,9 +65,11 @@ Ensure-Winget 'Python 3.12' 'Python.Python.3.12' { Test-Cmd 'python' }
 Ensure-Winget 'Temurin JDK 21' 'EclipseAdoptium.Temurin.21.JDK' {
     try { (& java -version 2>&1 | Out-String) -match 'version "(21|2[2-9])' } catch { $false }
 }
-Ensure-Winget 'Apache Maven' 'Apache.Maven' { Test-Cmd 'mvn' }
+# No Maven. There is no `Apache.Maven` package in winget (`winget search maven` returns
+# only unrelated packages), so requiring it made Phase 4 unreachable on a fresh machine.
+# 30-ghidra.ps1 builds the GhidraMCP extension with ghidra-mcp's own gradlew.bat, which
+# bootstraps Gradle itself and needs nothing but the JDK.
 Ensure-Winget 'Node.js LTS' 'OpenJS.NodeJS.LTS' { Test-Cmd 'node' }
-Ensure-Winget 'PowerShell 7' 'Microsoft.PowerShell' { Test-Cmd 'pwsh' }
 Ensure-Winget 'GitHub CLI' 'GitHub.cli' { Test-Cmd 'gh' }
 
 # Visual Studio 2022 with the C++ workload. Detection via vswhere.
@@ -72,7 +88,11 @@ if (-not $hasVs -and -not $CheckOnly) {
 Write-Host ''
 $results | Format-Table -AutoSize
 if ($results | Where-Object Status -in 'MISSING', 'FAILED') {
-    Write-Host 'Some components are missing/failed. New installs may need a NEW terminal (PATH refresh).'
+    Write-Host 'Some components are missing/failed. Re-run this script (installs are idempotent).'
+    exit 1
+}
+if ($results | Where-Object Status -like '*new shell*') {
+    Write-Host 'Installed, but not visible in this process. Start a new terminal, then re-run to confirm.'
     exit 1
 }
 Write-Host 'All prerequisites present.'

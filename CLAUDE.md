@@ -182,19 +182,42 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    run.py's report and records its verdict in `.analysis-verified.json`; that file, not the
    project directory, is what `-CheckOnly` trusts.
 3. ```powershell
-   .\setup\30-ghidra.ps1   # builds the MCP extension against BGS's managed Ghidra
+   .\setup\30-ghidra.ps1                 # builds + deploys the MCP extension and the bridge
+   .\setup\36-ghidra-mcp.ps1 -Start `
+       -Program /f4/vr/Fallout4VR.exe.unpacked.exe `
+       -WriteMcpConfigTo <your-plugin-dir>
    ```
-4. Manual once-per-machine (the script prints it): open Ghidra (BGS menu 6), confirm the
-   GhidraMCP extension is enabled, `Tools > GhidraMCP > Start MCP Server`.
+   **No GUI and no clicks — run both yourself.** Measured on a clean machine: server
+   answering in ~5 s, 226 REST endpoints, and the bridge registers 225 MCP tools against it.
+   `-Status` and `-Stop` manage it; `-File <binary>` analyses a loose DLL/EXE with no project.
 
-Give the project's Claude sessions access by copying `mcp\mcp.template.json` to the project as
-`.mcp.json` (the scaffolder already does this for new plugins).
+   **The build uses Gradle, not Maven.** `gradlew.bat` bootstraps itself and reads the Ghidra
+   jars straight out of the install, so the JDK is the only prerequisite. This is not a
+   preference: **there is no `Apache.Maven` package in winget**, so the old Maven-based
+   instructions could never complete on a fresh Windows machine.
 
-**Gate:** with Ghidra running + server started, an MCP session can `list_instances()` →
-`connect_instance(...)` → `decompile_function` on a function **and see CommonLib names/types
-in the output** (not just `FUN_*`). **Read `docs/GHIDRA_WORKFLOW.md` before real RE work —
-especially the connect ritual; skipping it makes the toolset look broken or, worse, reads the
-wrong binary.**
+   **Headless is invisible to `list_instances()` — this is expected, not a fault.** Discovery
+   probes `/mcp/instance_info`, which only the GUI plugin registers (`ServerManager.java`,
+   `GhidraMCPPlugin.java`); the headless server does not serve it, so the scan returns
+   nothing. It does serve `/mcp/schema`, so the bridge's TCP fallback connects anyway — which
+   is why the generated `.mcp.json` pins `GHIDRA_MCP_URL=http://127.0.0.1:8089`. **Do not
+   start the connect ritual with `list_instances()` on a headless server and conclude the
+   toolset is broken.** (README also documents a `/server_status` endpoint for headless;
+   `server_status` appears nowhere in the Java and returns 404.)
+
+   Use the GUI path instead only when you want to *look* at the disassembly. Note that
+   `patchGhidraUserConfig`, which makes the plugin auto-load, can only edit `FrontEndTool.xml`
+   if it already exists — and it does not until the Ghidra GUI has run once. So on a fresh
+   machine the first GUI launch has no MCP server; launch Ghidra once, re-run
+   `30-ghidra.ps1`, and it will auto-start from then on.
+
+**Gate:** `36-ghidra-mcp.ps1 -Status` reports a live connection, a non-zero tool count, and a
+loaded program; then an MCP session can `decompile_function` **and see CommonLib names/types
+in the output** (not just `FUN_*`). **Read `docs/GHIDRA_WORKFLOW.md` before real RE work.**
+
+A Ghidra project is single-writer. If the enrichment pipeline (or a GUI, or another agent)
+holds the lock, `36-ghidra-mcp.ps1` says who has it and starts with no project rather than
+failing deep inside Ghidra. **Never delete a `.lock` while its holder is alive.**
 
 Bonus once analysis is done: BGS menu option 10 exports symbols for **x64dbg** (live
 debugging with real names) and can build a synthetic PDB.

@@ -14,16 +14,32 @@ param(
     [switch]$BuildTest
 )
 
+. "$PSScriptRoot\_common.ps1"
+
+# A tool installed after this shell started is still only in the registry PATH; without
+# this the toolchain table reports FAIL for things that are installed and working.
+Sync-Path
+
 $rows = [System.Collections.Generic.List[object]]::new()
 function Check([string]$area, [string]$name, [bool]$ok, [string]$detail = '') {
     $rows.Add([pscustomobject]@{ Area = $area; Check = $name; OK = $(if ($ok) { 'PASS' } else { 'FAIL' }); Detail = $detail })
 }
 
-# toolchain
-foreach ($c in 'git', 'cmake', 'python', 'java', 'mvn', 'node', 'gh') {
+# toolchain. No 'mvn': the GhidraMCP extension builds with gradlew.bat (see 30-ghidra.ps1).
+foreach ($c in 'git', 'cmake', 'python', 'java', 'node', 'gh') {
     $cmd = Get-Command $c -ErrorAction SilentlyContinue
     Check 'toolchain' $c ($null -ne $cmd) $(if ($cmd) { $cmd.Source } else { 'not on PATH' })
 }
+# Ghidra 12 and the GhidraMCP build both need JDK 21+. `java` merely existing is not enough,
+# and a too-old JDK fails much later with an unrelated-looking error.
+if (Get-Command java -ErrorAction SilentlyContinue) {
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $javaVer = (& java -version 2>&1 | Out-String)
+    $ErrorActionPreference = $prev
+    $major = if ($javaVer -match 'version "(\d+)') { [int]$Matches[1] } else { 0 }
+    Check 'toolchain' 'java >= 21' ($major -ge 21) "major=$major"
+}
+
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vsVersions = @(if (Test-Path $vswhere) { & $vswhere -products '*' -requires Microsoft.VisualStudio.Workload.NativeDesktop -property installationVersion })
 $vsOk = [bool]($vsVersions | Where-Object { [int]($_ -split '\.')[0] -ge 17 })
@@ -66,9 +82,27 @@ if (Test-Path (Join-Path $bgsGhidra 'Ghidra\application.properties')) { $ghidras
 Check 'ghidra' 'install' ($ghidras.Count -gt 0) (($ghidras | Select-Object -ExpandProperty FullName) -join ', ')
 Check 'ghidra' 'bridge exe' (Test-Path (Join-Path $Root 'ghidra-mcp\.venv\Scripts\bridge-mcp-ghidra.exe'))
 if ($ghidras.Count) {
+    # GUI path only — headless loads the plugin off the classpath and ignores this.
     $ext = @(Get-ChildItem (Join-Path $env:APPDATA 'ghidra') -Directory -ErrorAction SilentlyContinue |
         Where-Object { Test-Path (Join-Path $_.FullName 'Extensions\GhidraMCP') })
-    Check 'ghidra' 'extension deployed' ($ext.Count -gt 0) (($ext | Select-Object -ExpandProperty Name) -join ', ')
+    Check 'ghidra' 'extension deployed (GUI)' ($ext.Count -gt 0) (($ext | Select-Object -ExpandProperty Name) -join ', ')
+}
+
+# headless MCP — what Phase 4 actually runs. 30-ghidra.ps1 writes both of these.
+$mcpManifest = Join-Path $PSScriptRoot '.ghidra-mcp-build.json'
+Check 'ghidra' 'headless build manifest' (Test-Path $mcpManifest) $mcpManifest
+if (Test-Path $mcpManifest) {
+    $mf = Get-Content $mcpManifest -Raw | ConvertFrom-Json
+    Check 'ghidra' 'plugin jar' (Test-Path $mf.pluginJar) $mf.pluginJar
+    Check 'ghidra' 'headless classpath argfile' (Test-Path $mf.headlessCpFile) $mf.headlessCpFile
+}
+# Live server is optional (it is started on demand), so report it without failing the run.
+try {
+    $c = Invoke-WebRequest 'http://127.0.0.1:8089/check_connection' -UseBasicParsing -TimeoutSec 2
+    $rows.Add([pscustomobject]@{ Area = 'ghidra'; Check = 'headless server (optional)'; OK = 'PASS'; Detail = $c.Content.Trim() })
+}
+catch {
+    $rows.Add([pscustomobject]@{ Area = 'ghidra'; Check = 'headless server (optional)'; OK = 'idle'; Detail = 'not running - start with setup\36-ghidra-mcp.ps1 -Start' })
 }
 
 # x64dbg

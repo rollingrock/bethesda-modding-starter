@@ -1,26 +1,39 @@
 ﻿<#
 .SYNOPSIS
-    Install Ghidra + the GhidraMCP extension + the MCP bridge (bethington/ghidra-mcp).
+    Build + deploy the GhidraMCP extension and the MCP bridge (bethington/ghidra-mcp).
 
 .DESCRIPTION
-    THE VERSION GATE: the GhidraMCP extension only loads in the exact Ghidra version it was
-    built for (extension.properties version == Ghidra's application.version). This script
-    builds the extension AGAINST the chosen install's version (mvn -Dghidra.version=...),
-    so bridge, extension and Ghidra always agree.
+    Builds with ghidra-mcp's Gradle build, NOT Maven. That is the upstream-canonical
+    backend ("Replaces Maven as the primary Java/plugin build backend" -- build.gradle),
+    and it removes two hard blockers:
+
+      * Maven is not installable. There is no `Apache.Maven` package in winget (search
+        "maven" returns only unrelated packages), so a fresh Windows machine could never
+        satisfy the old Maven prereq. gradlew.bat bootstraps Gradle itself -- nothing to
+        install beyond the JDK.
+      * The Maven path needed `mvn install:install-file` for 18 Ghidra jars before it
+        could compile. Gradle consumes them straight out of the install via fileTree.
+
+    THE VERSION GATE: the extension only loads in the exact Ghidra version it was built
+    for (extension.properties `version` must equal the install's application.version).
+    Gradle's processResources stamps that from GHIDRA_INSTALL_DIR, so passing the right
+    install is the whole configuration -- and this script re-reads the built zip to prove
+    the stamp matches before deploying.
 
     Which Ghidra? In order:
       1. -GhidraPath, if given.
-      2. BethesdaGhidraScripts' managed install (<Root>\BethesdaGhidraScripts\tools\ghidra) —
-         preferred, so ONE Ghidra serves both the enrichment pipeline and the MCP bridge.
-         (Run its `python run.py` menu option 1 first to install it.)
-      3. An existing <ToolsDir>\ghidra_<pom-version>_* install.
-      4. Download the stock release matching ghidra-mcp's pom from the NSA GitHub.
+      2. BethesdaGhidraScripts' managed install (<Root>\BethesdaGhidraScripts\tools\ghidra)
+         -- preferred, so ONE Ghidra serves both the enrichment pipeline and MCP, and so
+         MCP can open the project that pipeline produced.
+      3. An existing <ToolsDir>\ghidra_* install (newest wins).
 
-    Also (idempotent): creates ghidra-mcp's .venv (pip install -e . -> bridge exe), installs
-    the Ghidra jars into ~/.m2, builds the extension with Maven (JDK 21 + Maven from
-    00-prereqs), unzips it into the per-version user Extensions dir (never restarts Ghidra),
-    and sets user env GHIDRA_MCP_ALLOW_SCRIPTS=1 (read by the Ghidra JVM, NOT the bridge —
-    putting it in .mcp.json env would be inert; it gates run_script_inline).
+    Also (all idempotent):
+      * creates ghidra-mcp's .venv -> bridge-mcp-ghidra.exe
+      * writes setup/.ghidra-headless-cp.txt, a java @argfile holding the ~194-jar
+        classpath the headless server needs (see 36-ghidra-mcp.ps1)
+      * records what it built in setup/.ghidra-mcp-build.json
+
+    Does NOT start Ghidra and does NOT require the GUI. See 36-ghidra-mcp.ps1.
 #>
 [CmdletBinding()]
 param(
@@ -28,19 +41,22 @@ param(
     [string]$ToolsDir = 'C:\tools',
     [string]$Root = 'C:\repos',
     # Explicit Ghidra install to build the extension for (overrides auto-detection).
-    [string]$GhidraPath = ''
+    [string]$GhidraPath = '',
+    # Skip the GUI-only deploy (extension zip + user profile + FrontEndTool.xml patch).
+    # Headless does not read any of it -- it loads the plugin classes off the classpath.
+    [switch]$HeadlessOnly
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot\_common.ps1"
+Sync-Path
 
-if (-not (Test-Path (Join-Path $GhidraMcpDir 'pom.xml'))) {
-    throw "ghidra-mcp not found at $GhidraMcpDir — run setup/20-repos.ps1 first."
+if (-not (Test-Path (Join-Path $GhidraMcpDir 'gradlew.bat'))) {
+    throw "ghidra-mcp not found at $GhidraMcpDir - run setup/20-repos.ps1 first."
 }
-
-[xml]$pom = Get-Content (Join-Path $GhidraMcpDir 'pom.xml')
-$pomVer = $pom.project.properties.'ghidra.version'
-if (-not $pomVer) { throw 'Could not read <ghidra.version> from pom.xml' }
-Write-Host "ghidra-mcp's pom targets Ghidra $pomVer (used only if no local install is found)"
+if (-not (Test-Cmd 'java')) {
+    throw 'java is not on PATH. Run setup/00-prereqs.ps1 (Temurin JDK 21).'
+}
 
 function Get-GhidraProps([string]$installDir) {
     $propFile = Join-Path $installDir 'Ghidra\application.properties'
@@ -50,7 +66,7 @@ function Get-GhidraProps([string]$installDir) {
     $props
 }
 
-# pick the install
+# ---------------------------------------------------------------- pick the install
 $ghidraHome = $null
 if ($GhidraPath) {
     if (-not (Get-GhidraProps $GhidraPath)) { throw "-GhidraPath $GhidraPath is not a Ghidra install (no Ghidra\application.properties)" }
@@ -64,109 +80,159 @@ if (-not $ghidraHome) {
     }
 }
 if (-not $ghidraHome) {
-    $ghidraHome = Get-ChildItem $ToolsDir -Directory -Filter "ghidra_${pomVer}_*" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $ghidraHome = Get-ChildItem $ToolsDir -Directory -Filter 'ghidra_*' -ErrorAction SilentlyContinue |
+        Where-Object { Get-GhidraProps $_.FullName } | Sort-Object Name -Descending | Select-Object -First 1
 }
 if (-not $ghidraHome) {
-    Write-Host "Fetching Ghidra $pomVer release info from GitHub ..."
-    $releases = Invoke-RestMethod 'https://api.github.com/repos/NationalSecurityAgency/ghidra/releases?per_page=100'
-    $rel = $releases | Where-Object { $_.tag_name -like "Ghidra_${pomVer}_*" } | Select-Object -First 1
-    if (-not $rel) { throw "No NSA Ghidra release found for version $pomVer. Check https://github.com/NationalSecurityAgency/ghidra/releases" }
-    $asset = $rel.assets | Where-Object name -like '*.zip' | Select-Object -First 1
-    $zip = Join-Path $env:TEMP $asset.name
-    Write-Host "Downloading $($asset.name) ($([math]::Round($asset.size/1MB)) MB) ..."
-    Invoke-WebRequest $asset.browser_download_url -OutFile $zip
-    if (-not (Test-Path $ToolsDir)) { New-Item -ItemType Directory -Force $ToolsDir | Out-Null }
-    Write-Host "Extracting to $ToolsDir ..."
-    Expand-Archive $zip -DestinationPath $ToolsDir
-    Remove-Item $zip
-    $ghidraHome = Get-ChildItem $ToolsDir -Directory -Filter "ghidra_${pomVer}_*" | Select-Object -First 1
-    if (-not $ghidraHome) { throw 'Extraction did not produce the expected ghidra_* folder.' }
+    throw @"
+No Ghidra install found. Install one first -- the enrichment pipeline and MCP should share it:
+  cd $(Join-Path $Root 'BethesdaGhidraScripts'); python run.py setup
+(or pass -GhidraPath <dir> to build against an install you already have).
+"@
 }
 
-# the REAL version + user-profile dir name come from the install itself, not its folder name
 $props = Get-GhidraProps $ghidraHome.FullName
 $ver = $props['application.version']
 $profileName = "ghidra_$($ver)_$($props['application.release.name'])"
 Write-Host "Ghidra install: $($ghidraHome.FullName)  (version $ver, profile $profileName)"
 
-# 3. bridge venv (console script bridge-mcp-ghidra.exe; runtime dep is just `mcp`)
+# ---------------------------------------------------------------- build the extension
+$gradlew = Join-Path $GhidraMcpDir 'gradlew.bat'
+$gradleArgs = @('--no-daemon', "-PGHIDRA_INSTALL_DIR=$($ghidraHome.FullName)")
+
+Push-Location $GhidraMcpDir
+try {
+    Write-Host "Building the GhidraMCP extension for Ghidra $ver (first run downloads Gradle) ..."
+    # A cold wrapper can lose the Ghidra fileTree on its very first invocation and fail
+    # with a wall of "package ghidra.* does not exist"; the identical command then
+    # succeeds. Retry once so that flake never becomes a human decision.
+    try {
+        Invoke-Native -Exe $gradlew -Arguments ($gradleArgs + 'buildExtension') -ErrorMessage 'gradlew buildExtension failed.'
+    }
+    catch {
+        Write-Host 'First Gradle run failed; retrying once (cold-wrapper flake) ...'
+        Invoke-Native -Exe $gradlew -Arguments ($gradleArgs + 'buildExtension') -ErrorMessage 'gradlew buildExtension failed twice.'
+    }
+}
+finally { Pop-Location }
+
+$extZip = Get-ChildItem (Join-Path $GhidraMcpDir 'build\distributions') -Filter 'GhidraMCP-*.zip' -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $extZip) { throw 'Gradle reported success but produced no GhidraMCP-*.zip in build/distributions.' }
+
+# Prove the version gate rather than trusting it: read the stamp back out of the zip.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$zip = [IO.Compression.ZipFile]::OpenRead($extZip.FullName)
+try {
+    $entry = $zip.Entries | Where-Object FullName -like '*extension.properties' | Select-Object -First 1
+    if (-not $entry) { throw "No extension.properties inside $($extZip.Name)." }
+    $reader = New-Object IO.StreamReader($entry.Open())
+    $extProps = $reader.ReadToEnd()
+    $reader.Close()
+}
+finally { $zip.Dispose() }
+if ($extProps -notmatch '(?m)^version=(.+)$') { throw "extension.properties in $($extZip.Name) has no version= line." }
+$stamped = $Matches[1].Trim()
+if ($stamped -ne $ver) {
+    throw "Version gate would reject this build: extension.properties says $stamped, Ghidra is $ver."
+}
+Write-Host "Built $($extZip.Name)  (version gate: $stamped == $ver OK)"
+
+$pluginJar = Get-ChildItem (Join-Path $GhidraMcpDir 'build\libs') -Filter 'GhidraMCP-*.jar' -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $pluginJar) { throw 'No GhidraMCP-*.jar in build/libs - headless has nothing to run.' }
+
+# ---------------------------------------------------------------- deploy (GUI path only)
+if ($HeadlessOnly) {
+    Write-Host 'Skipping the GUI deploy (-HeadlessOnly).'
+}
+else {
+    Push-Location $GhidraMcpDir
+    try {
+        # `deploy` = stopGhidra + deployExtension + installUserExtension + patchGhidraUserConfig.
+        Invoke-Native -Exe $gradlew -Arguments ($gradleArgs + 'deploy') -ErrorMessage 'gradlew deploy failed.'
+    }
+    finally { Pop-Location }
+
+    $userExt = Join-Path $env:APPDATA "ghidra\$profileName\Extensions\GhidraMCP"
+    if (-not (Test-Path $userExt)) { throw "deploy reported success but $userExt is missing." }
+    Write-Host "Extension deployed to $userExt"
+
+    # patchGhidraUserConfig can only edit FrontEndTool.xml if it exists, and it does not
+    # exist until the Ghidra GUI has been launched at least once. On a fresh machine the
+    # patch is therefore a silent no-op and the plugin will not auto-load in the GUI.
+    # Headless is unaffected, so this is a note rather than a failure.
+    if (-not (Test-Path (Join-Path $env:APPDATA "ghidra\$profileName\FrontEndTool.xml"))) {
+        Write-Host 'NOTE: the Ghidra GUI has never run for this profile, so FrontEndTool.xml does'
+        Write-Host '      not exist yet and the plugin auto-load patch was a no-op. Either use the'
+        Write-Host '      headless server (36-ghidra-mcp.ps1, no GUI needed) or launch Ghidra once'
+        Write-Host '      and re-run this script to make the GUI auto-start the MCP server too.'
+    }
+}
+
+# ---------------------------------------------------------------- bridge venv
 $venvExe = Join-Path $GhidraMcpDir '.venv\Scripts\bridge-mcp-ghidra.exe'
 if (-not (Test-Path $venvExe)) {
     Write-Host 'Creating ghidra-mcp .venv and installing the bridge (pip install -e .) ...'
     Push-Location $GhidraMcpDir
     try {
-        python -m venv .venv
-        & .\.venv\Scripts\python.exe -m pip install --quiet --upgrade pip
-        & .\.venv\Scripts\pip.exe install --quiet -e .
+        Invoke-Native -Exe 'python' -Arguments @('-m', 'venv', '.venv')
+        Invoke-Native -Exe (Join-Path $GhidraMcpDir '.venv\Scripts\python.exe') -Arguments @('-m', 'pip', 'install', '--quiet', '--upgrade', 'pip')
+        Invoke-Native -Exe (Join-Path $GhidraMcpDir '.venv\Scripts\pip.exe') -Arguments @('install', '--quiet', '-e', '.')
     }
     finally { Pop-Location }
-    if (-not (Test-Path $venvExe)) { throw 'bridge-mcp-ghidra.exe did not appear — pip install failed?' }
+    if (-not (Test-Path $venvExe)) { throw 'bridge-mcp-ghidra.exe did not appear - pip install failed?' }
 }
 Write-Host "Bridge: $venvExe"
 
-# 4. install the Ghidra jars into ~/.m2, then build the extension with Maven directly.
-# We deliberately do NOT use ghidra-mcp's `tools.setup` here: it hard-requires `uv` and its
-# deploy step restarts Ghidra (dangerous under a running instance with unsaved analysis).
-# Everything it does for us is three plain steps: install-file the jars, mvn package, unzip.
-$extZip = Get-ChildItem (Join-Path $GhidraMcpDir 'target') -Filter 'GhidraMCP-*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
-# A zip built for a DIFFERENT Ghidra version fails the load gate — force a rebuild then.
-$builtProps = Join-Path $GhidraMcpDir 'target\classes\extension.properties'
-if ($extZip -and (Test-Path $builtProps) -and -not ((Get-Content $builtProps) -contains "version=$ver")) {
-    Write-Host "Existing build targets a different Ghidra version — rebuilding for $ver."
-    $extZip = $null
+# ---------------------------------------------------------------- headless classpath argfile
+# The headless server is a GhidraLaunchable, not a fat jar: `java -jar` cannot work because
+# the assembly deliberately excludes the Ghidra jars ("provided by Ghidra at runtime").
+# Docker's entrypoint.sh builds the classpath from Framework/Features/Processors; we do the
+# same here. ~194 jars is ~20 KB of command line, close enough to Windows' 32 KB limit to
+# be worth avoiding, so it goes in a java @argfile instead.
+$jars = @($pluginJar.FullName)
+foreach ($d in 'Framework', 'Features', 'Processors', 'Debug') {
+    $jars += Get-ChildItem (Join-Path $ghidraHome.FullName "Ghidra\$d") -Recurse -Filter '*.jar' -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty FullName
 }
-if (-not $extZip) {
-    # The pom depends on ghidra:* artifacts that only exist inside a Ghidra install.
-    # Derive the list from the pom itself so upstream changes don't strand us.
-    $ghidraDeps = @($pom.project.dependencies.dependency | Where-Object groupId -eq 'ghidra')
-    Write-Host "Installing $($ghidraDeps.Count) Ghidra jars into the local Maven repo (version $ver) ..."
-    foreach ($dep in $ghidraDeps) {
-        $m2jar = Join-Path $env:USERPROFILE ".m2\repository\ghidra\$($dep.artifactId)\$ver\$($dep.artifactId)-$ver.jar"
-        if (Test-Path $m2jar) { continue }
-        $jar = Get-ChildItem $ghidraHome.FullName -Recurse -Filter "$($dep.artifactId).jar" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $jar) { throw "Could not find $($dep.artifactId).jar inside $($ghidraHome.FullName)" }
-        & mvn --quiet install:install-file "-Dfile=$($jar.FullName)" '-DgroupId=ghidra' `
-            "-DartifactId=$($dep.artifactId)" "-Dversion=$ver" '-Dpackaging=jar'
-        if ($LASTEXITCODE -ne 0) { throw "mvn install:install-file failed for $($dep.artifactId)" }
-    }
-    # Clear failed-download markers a previous broken attempt may have left; they make
-    # Maven ignore the jars we just installed.
-    Get-ChildItem (Join-Path $env:USERPROFILE '.m2\repository\ghidra') -Recurse -Filter '*.lastUpdated' -ErrorAction SilentlyContinue | Remove-Item -Force
+$cpFile = Join-Path $PSScriptRoot '.ghidra-headless-cp.txt'
+# Forward slashes: an @argfile treats backslash as an escape character.
+$cpText = '-classpath "' + (($jars | ForEach-Object { $_ -replace '\\', '/' }) -join ';') + '"'
+[IO.File]::WriteAllText($cpFile, $cpText, [Text.UTF8Encoding]::new($false))
+Write-Host "Headless classpath: $($jars.Count) jars -> $cpFile"
 
-    Write-Host "Building the GhidraMCP extension for Ghidra $ver (first run takes a few minutes) ..."
-    Push-Location $GhidraMcpDir
-    try {
-        # -Dghidra.version overrides the pom property, so the extension's version gate
-        # matches whatever install we resolved above (verified: CLI -D wins over the pom).
-        & mvn clean package assembly:single -DskipTests "-Dghidra.version=$ver" --quiet
-        if ($LASTEXITCODE -ne 0) { throw 'Maven build of the GhidraMCP extension failed.' }
-    }
-    finally { Pop-Location }
-    $extZip = Get-ChildItem (Join-Path $GhidraMcpDir 'target') -Filter 'GhidraMCP-*.zip' | Select-Object -First 1
-    if (-not $extZip) { throw 'Build reported success but no GhidraMCP-*.zip in target/.' }
-}
-
-# Deploy = unzip into the per-version user Extensions dir (the same thing Ghidra's
-# File > Install Extensions does). No Ghidra restart is ever triggered from here.
-# NOTE: the profile dir is named from application.properties, NOT the install folder —
-# BethesdaGhidraScripts' install lives in a folder called just "ghidra".
-$userExt = Join-Path $env:APPDATA "ghidra\$profileName\Extensions"
-New-Item -ItemType Directory -Force $userExt | Out-Null
-Expand-Archive $extZip.FullName -DestinationPath $userExt -Force
-Write-Host "Extension deployed to $userExt"
-
-# 5. script-execution gate for run_script_inline (JVM-side env var)
+# ---------------------------------------------------------------- run_script_inline gate
+# Off by default upstream since v5.4.1 because /run_script_inline and /run_ghidra_script
+# execute arbitrary Java in the Ghidra process. We turn it on deliberately: it is the
+# difference between one call and N round-trips for every "for each X tell me Y" question
+# (see docs/GHIDRA_WORKFLOW.md), and both servers here bind 127.0.0.1 only.
+# It is read by the Ghidra JVM, NOT by the bridge -- putting it in .mcp.json's env is inert.
+# Persisted at User scope for the GUI; 36-ghidra-mcp.ps1 also injects it into the headless
+# process so it applies without opening a new terminal.
 if ([Environment]::GetEnvironmentVariable('GHIDRA_MCP_ALLOW_SCRIPTS', 'User') -ne '1') {
     [Environment]::SetEnvironmentVariable('GHIDRA_MCP_ALLOW_SCRIPTS', '1', 'User')
-    Write-Host 'Set user env GHIDRA_MCP_ALLOW_SCRIPTS=1 (enables run_script_inline; restart Ghidra to pick it up).'
+    $env:GHIDRA_MCP_ALLOW_SCRIPTS = '1'
+    Write-Host 'Set user env GHIDRA_MCP_ALLOW_SCRIPTS=1 (enables run_script_inline).'
+    Write-Host '  To opt out: [Environment]::SetEnvironmentVariable(''GHIDRA_MCP_ALLOW_SCRIPTS'', $null, ''User'')'
 }
 
+# ---------------------------------------------------------------- manifest
+$manifest = [ordered]@{
+    generatedAt    = (Get-Date).ToString('o')
+    ghidraHome     = $ghidraHome.FullName
+    ghidraVersion  = $ver
+    ghidraProfile  = $profileName
+    extensionZip   = $extZip.FullName
+    pluginJar      = $pluginJar.FullName
+    bridgeExe      = $venvExe
+    headlessCpFile = $cpFile
+    headlessClass  = 'com.xebyte.headless.GhidraMCPHeadlessServer'
+    guiDeployed    = (-not $HeadlessOnly)
+}
+$manifestPath = Join-Path $PSScriptRoot '.ghidra-mcp-build.json'
+$manifest | ConvertTo-Json | Set-Content $manifestPath -Encoding UTF8
+Write-Host "Wrote $manifestPath"
+
 Write-Host ''
-Write-Host '=== Once-per-machine manual steps ==='
-Write-Host '1. Build the analysis database with BethesdaGhidraScripts (types + vtables + names):'
-Write-Host "   cd $(Join-Path $Root 'BethesdaGhidraScripts'); drop game EXEs into exes\<game>\<ver>\; python run.py"
-Write-Host '   -> menu 1 (prereqs), 2 (submodules), 7 (full rebuild; auto-analysis takes hours - let it finish).'
-Write-Host "2. Start Ghidra: $($ghidraHome.FullName)\ghidraRun.bat (or BGS menu option 6)."
-Write-Host '3. File > Install Extensions -> verify GhidraMCP is listed and checked; restart Ghidra if it was not.'
-Write-Host '4. In the CodeBrowser: Tools > GhidraMCP > Start MCP Server (listens on 127.0.0.1:8089).'
-Write-Host '5. In every Claude session: list_instances() -> connect_instance(...) FIRST, or analysis tools do not exist.'
+Write-Host 'Next: .\setup\36-ghidra-mcp.ps1 -Start   (headless MCP server, no GUI, no clicks)'
