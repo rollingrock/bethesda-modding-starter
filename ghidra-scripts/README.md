@@ -61,6 +61,31 @@ python apply_prototypes.py apply --tier 1 --apply      # commits
 **Back up the project first.** This writes to a database that took hours to build. Every
 applied change is journalled to `.proto-cache/journal.jsonl`.
 
+### Measured on F4VR (2026-08-16)
+
+25,867 functions carry a signature in their name. After probing all of them:
+
+| | |
+|---|---|
+| **Tier 1** — every argument typed | **9,437** |
+| **Tier 2** — some arguments `void *` | **3,671** |
+| Tier 3 — skipped | 12,759 |
+| &nbsp;&nbsp;ambiguous this-ness | 6,032 |
+| &nbsp;&nbsp;no argument type resolves | 5,571 |
+| &nbsp;&nbsp;inferred arity exceeds args+1 | 1,155 |
+
+**13,108 prototypes planned; all 13,108 validated by Ghidra's own parser, 0 rejected.**
+Of those, 4,176 get a typed `this`, 8,689 get `void * this` (the class type does not exist),
+and 243 are free functions with no `this` at all.
+
+`void * this` is still worth having: it marks the this-pointer so every *other* parameter
+lands in the right position, which is where most of the value is. It just gives no field
+access on `this` itself.
+
+The probe costs ~350 ms/function — the decompiler, not HTTP — so about 100 minutes for the
+full corpus on this machine. It is resumable, and `--from-plan` re-probes only what a plan
+already contains.
+
 ### Why it is more than a string substitution
 
 A demangled C++ name is missing two things, and both will bite:
