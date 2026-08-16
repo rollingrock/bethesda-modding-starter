@@ -228,9 +228,25 @@ debugging with real names) and can build a synthetic PDB.
 .\setup\40-x64dbg.ps1
 ```
 
+Verified on a clean machine: pulls the x64dbg snapshot and installs the pinned MCP plugin into
+both `x64\plugins\x64dbg_mcp.dp64` and `x32\plugins\x64dbg_mcp.dp32`. Runs unattended.
+
+**Load the symbols Phase 4 exported — that is the entire point.** `35-ghidra-analysis.ps1`
+writes `<bgs>\symbols\<game>\<Game>.dd64`, an x64dbg database in exactly x64dbg's own format
+(`{"labels":[{module,address,manual,text}]}`, RVAs against `fallout4vr.exe`). Measured on F4VR:
+**60,671 labels**, carrying real C++ signatures like
+`BGSAIWorldLocation::LoadLocation(BGSLoadFormBuffer*)` rather than `sub_1250`. Without it
+you are debugging raw addresses. Note the file is plain JSON, not gzipped — x64dbg reads both.
+
+**Never probe the npm server with `--version` or `--help`.** It ignores them, starts the stdio
+MCP server, and logs `Timeout: none (waits indefinitely)` — the call hangs until something
+kills it. Confirm the pin from `mcp/mcp.template.json` instead; a successful start prints
+`[x64dbg-mcp] Server started (23 tools), plugin expected at 127.0.0.1:27042`.
+
 **Gate:** launching `C:\tools\x64dbg\x96dbg.exe` → x64 → log shows
 `[MCP] x64dbg MCP Server started on 127.0.0.1:27042`. For MO2-managed games: launch the game
-through MO2 first, then **attach** x64dbg to the process.
+through MO2 first, then **attach** x64dbg to the process. (This last step needs the game, so
+it is the one part of Phase 5 an agent cannot self-verify.)
 
 ## Phase 6 — devbench (in-game instrumentation)
 

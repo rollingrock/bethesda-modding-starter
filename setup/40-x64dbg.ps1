@@ -53,9 +53,26 @@ foreach ($pair in @(@{ Ext = '.dp64'; Dir = 'x64' }, @{ Ext = '.dp32'; Dir = 'x3
     }
 }
 
+# 3. point at the symbols Phase 4 exported — debugging without them is raw addresses
+$symRoot = 'C:\repos\BethesdaGhidraScripts\symbols'
+$dd = @(Get-ChildItem $symRoot -Recurse -Filter '*.dd64' -ErrorAction SilentlyContinue)
+Write-Host ''
+if ($dd.Count) {
+    Write-Host 'x64dbg symbol databases exported by Phase 4 (load via File > Import database):'
+    foreach ($d in $dd) { Write-Host ("  {0}  ({1:N1} MB)" -f $d.FullName, ($d.Length / 1MB)) }
+}
+else {
+    Write-Host "No *.dd64 under $symRoot yet - run setup\35-ghidra-analysis.ps1 first, or you"
+    Write-Host 'will be debugging unnamed addresses.'
+}
+
 Write-Host ''
 Write-Host 'Done. Runtime contract:'
 Write-Host " - Launch $InstallDir\x96dbg.exe (picks x32/x64), attach or open a target."
 Write-Host ' - The plugin logs: [MCP] x64dbg MCP Server started on 127.0.0.1:27042'
 Write-Host ' - Claude reaches it via the "x64dbg" entry in .mcp.json (npx x64dbg-mcp-server, pinned).'
 Write-Host ' - Debugging a game under MO2: launch the game through MO2, then ATTACH x64dbg to the process.'
+Write-Host ''
+Write-Host 'Do NOT run `npx x64dbg-mcp-server --version` to check the install: it ignores the'
+Write-Host 'flag, starts the stdio server and waits forever. A good start prints'
+Write-Host '  [x64dbg-mcp] Server started (23 tools), plugin expected at 127.0.0.1:27042'
