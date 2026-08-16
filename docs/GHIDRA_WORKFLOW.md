@@ -80,6 +80,16 @@ GUI mode (PluginTool not available)"*, the same GUI-only family as `/mcp/instanc
 the non-existent `/server_status`. Use the pipeline's import layout for program paths
 (`/f4/vr/Fallout4VR.exe.unpacked.exe`).
 
+## `limit` is not honoured by the listing endpoints — this will blow up your context
+
+`GET /list_functions?limit=40` against F4VR returns **all 227,212 functions**: 12.2 MB, 19
+seconds. The parameter is accepted and ignored. Never pipe a listing endpoint straight into
+a session; write it to a file and filter there, or use a targeted lookup
+(`decompile_function?address=…`) instead. The response shape is
+`{"functions":[{name,address}],"count":N}` — note `functions`/`count`, not the `{"data":…}`
+envelope other endpoints use, and `/mcp/schema` uses `{"tools":[…],"count":N}` again. Check
+the shape before counting; guessing `.data` silently yields 0.
+
 ## The version gate
 
 The GhidraMCP extension only loads in the exact Ghidra version it was built for

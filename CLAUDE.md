@@ -212,8 +212,26 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    `30-ghidra.ps1`, and it will auto-start from then on.
 
 **Gate:** `36-ghidra-mcp.ps1 -Status` reports a live connection, a non-zero tool count, and a
-loaded program; then an MCP session can `decompile_function` **and see CommonLib names/types
-in the output** (not just `FUN_*`). **Read `docs/GHIDRA_WORKFLOW.md` before real RE work.**
+loaded program; then an MCP session can `decompile_function` and see **real names** rather
+than `FUN_*`. **Read `docs/GHIDRA_WORKFLOW.md` before real RE work.**
+
+Measured end to end on F4VR (2026-08-16), so you know what "done" looks like:
+
+| | |
+|---|---|
+| functions | 227,212 |
+| named (not `FUN_*`) | 61,136 (26.9%) |
+| fully-scoped `Class::Method(args)` | 25,883 |
+| data types loaded | 45,696, of which 44,738 under `/CommonLibF4/` |
+
+**Names yes, prototypes no — do not expect typed decompiles.** The CommonLibF4 types are in
+the program, and the function *name* carries the full signature
+(`BGSAIWorldLocationPointRadius::Allocate(NiPoint3&,TESObjectCELL*,TESWorldSpace*,float,float)`),
+but the function's applied prototype is still `undefined4 *param_1, longlong param_2, ...`.
+That is because the bulk of these names come from the VR address-library import, which sets
+names only. The signature you want is sitting in the name string and the types it references
+are already loaded, so `set_function_prototype` / `apply_data_type` can close the gap
+per-function — a worthwhile bulk pass, not something the pipeline does for you.
 
 A Ghidra project is single-writer. If the enrichment pipeline (or a GUI, or another agent)
 holds the lock, `36-ghidra-mcp.ps1` says who has it and starts with no project rather than
