@@ -4,7 +4,7 @@
 		{
 			"name": "vr-mo2",
 			"displayName": "VR — deploy DLL/PDB into an MO2 mod folder (recommended for MO2 users)",
-			"inherits": "vs2022-windows-vcpkg-vr",
+			"inherits": "windows-vcpkg-vr",
 			"cacheVariables": {
 				"MO2_INSTALL_PATH": "C:/MO2/Fallout4VR/mods/starterplugin/F4SE/Plugins"
 			}
@@ -12,7 +12,7 @@
 		{
 			"name": "vr-copy",
 			"displayName": "VR — copy into the game's real Data/F4SE/Plugins (non-MO2 installs)",
-			"inherits": "vs2022-windows-vcpkg-vr",
+			"inherits": "windows-vcpkg-vr",
 			"cacheVariables": {
 				"COPY_BUILD": true
 			},

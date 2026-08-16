@@ -7,7 +7,9 @@
     clones are left alone (a message notes they exist; no pull is forced).
 
     What and why:
-      CommonLibF4        rollingrock/CommonLibF4 — NG-style: one lib builds flat F4 AND F4VR.
+      CommonLibF4        alandtse/CommonLibF4 — NG-style with runtime dispatch: ENABLE_FALLOUT_F4
+                         /_NG/_VR default ON, so ONE DLL serves pre-NG Fallout 4, the Next-Gen
+                         update and Fallout 4 VR, choosing at load time via REL::Module.
                          Plugin repos consume it as a submodule; this standalone clone is for
                          reading/searching the headers and for the CommonLibF4Path fallback.
       commonlibsf        libxse/commonlibsf — Starfield CommonLib (xmake-based).
@@ -39,7 +41,7 @@ $ErrorActionPreference = 'Stop'
 if (-not (Test-Path $Root)) { New-Item -ItemType Directory -Force $Root | Out-Null }
 
 $repos = @(
-    @{ Name = 'CommonLibF4';  Url = 'https://github.com/rollingrock/CommonLibF4.git';   Args = @() }
+    @{ Name = 'CommonLibF4';  Url = 'https://github.com/alandtse/CommonLibF4.git';      Args = @() }
     @{ Name = 'commonlibsf';  Url = 'https://github.com/libxse/commonlibsf.git';        Args = @('--recurse-submodules') }
     @{ Name = 'devbench';     Url = 'https://github.com/rollingrock/devbench.git';      Args = @('--branch', 'feat/multigame-core', '--recurse-submodules') }
     @{ Name = 'ghidra-mcp';   Url = 'https://github.com/bethington/ghidra-mcp.git';     Args = @() }

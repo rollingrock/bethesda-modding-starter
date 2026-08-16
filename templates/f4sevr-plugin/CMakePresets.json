@@ -76,6 +76,28 @@
       "cacheVariables": {
         "CMAKE_CXX_FLAGS": "/EHsc /MP /W4 /external:anglebrackets /external:W0 $penv{CXXFLAGS}"
       },
+      "inherits": ["vr", "cmake-dev", "vcpkg", "windows"],
+      "name": "windows-vcpkg-vr"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "/EHsc /MP /W4 /external:anglebrackets /external:W0 $penv{CXXFLAGS}"
+      },
+      "inherits": ["flat", "cmake-dev", "vcpkg", "windows"],
+      "name": "windows-vcpkg"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "/EHsc /MP /W4 /external:anglebrackets /external:W0 $penv{CXXFLAGS}"
+      },
+      "generator": "Visual Studio 18 2026",
+      "inherits": ["vr", "cmake-dev", "vcpkg", "windows"],
+      "name": "vs2026-windows-vcpkg-vr"
+    },
+    {
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "/EHsc /MP /W4 /external:anglebrackets /external:W0 $penv{CXXFLAGS}"
+      },
       "generator": "Visual Studio 16 2019",
       "inherits": ["vr", "cmake-dev", "vcpkg", "windows"],
       "name": "vs2019-windows-vcpkg-vr"

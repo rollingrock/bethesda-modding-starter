@@ -37,8 +37,15 @@ set_from_environment(VCPKG_ROOT)
 add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 set(CommonLibName "CommonLibF4")
 
+# alandtse/CommonLibF4 dispatches at runtime: ENABLE_FALLOUT_F4/_NG/_VR are all ON by
+# default, so ONE DLL serves pre-NG Fallout 4, the Next-Gen update and Fallout 4 VR and
+# picks between them at load time via REL::Module. There is no FALLOUTVR define to set --
+# BUILD_FALLOUTVR here only chooses which install this project deploys to and which build
+# directory it uses.
+set(F4SE_SUPPORT_XBYAK ON CACHE BOOL "" FORCE)   # PCH.h includes xbyak; the lib gates it
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)         # do not build CommonLibF4's Catch2 suite
+
 if(BUILD_FALLOUTVR)
-	add_compile_definitions(FALLOUTVR)
 	set_from_environment(FalloutVRPath)
 	set(FalloutPath ${FalloutVRPath})
 	set(FalloutVersion "Fallout VR")
@@ -98,9 +105,9 @@ if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
 endif()
 
 # ---- Globals ----
-add_compile_definitions(
-	F4SE_SUPPORT_XBYAK
-)
+# NOTE: F4SE_SUPPORT_XBYAK is NOT defined here. CommonLibF4 exports it PUBLIC as
+# F4SE_SUPPORT_XBYAK=1 when its option is ON (set above); defining a bare copy here too
+# would be a macro redefinition, which /WX turns into a build error.
 
 if(MSVC)
 	if(NOT ${CMAKE_GENERATOR} STREQUAL "Ninja")

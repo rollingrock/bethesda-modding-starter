@@ -1,21 +1,21 @@
 name: E2E scaffold + build (F4VR)
 
-# CLAUDE.md calls the Phase 3 build "the real proof": it exercises VS2022 + C++23, CMake,
-# vcpkg restore, the CommonLibF4 submodule and the whole chain in one gate. This runs it on
-# a clean windows-latest runner, which is the closest thing to the fresh machine this pack
-# targets -- and free of the accumulated local state that hid the 5.1 parse bug.
+# CLAUDE.md calls the Phase 3 build "the real proof": it exercises the MSVC toolchain and
+# C++23, CMake, the vcpkg restore, the CommonLibF4 submodule and the whole chain in one gate.
+# This runs it on clean runners, the closest thing to the fresh machine this pack targets --
+# and free of the accumulated local state that hid the 5.1 parse bug.
 #
 # Deliberately NOT configured here: a git identity. A freshly installed git has none, and
 # New-Plugin.ps1 has to cope with that on its own. Leaving it unset keeps that guarantee
 # under test. (winget is likewise absent from the runner image, so 00-prereqs.ps1 is skipped
 # and the preinstalled VS/CMake/git are used instead.)
 #
-# Pinned to windows-2022, NOT windows-latest. windows-latest now ships Visual Studio 18
-# (MSVC 14.51) only, and CommonLibF4 does not compile there: under C++23's P2266 a returned
-# local is an rvalue, so `hkVector4f& GetNormalized() { ...; return norm; }` in
-# RE/Havok/hkVector4.h no longer binds and fails with C2440. 00-prereqs.ps1 installs
-# VS2022 and the presets pin the v143 toolset, so VS2022 is what this pack actually
-# targets -- the runner should match. Revisit once CommonLibF4 builds clean on 14.5x.
+# Matrixed over both runner images on purpose. windows-2022 has Visual Studio 17 and
+# windows-latest has Visual Studio 18 (MSVC 14.5x); the default `windows-vcpkg-vr` preset
+# pins no generator, so each takes what it finds. Building on both is what keeps the pack
+# honest about working on a machine set up today as well as one set up two years ago.
+# (This is only possible since the submodule moved to alandtse/CommonLibF4 -- the previous
+# fork could not compile on 14.5x, see CLAUDE.md Phase 3.)
 #
 # Failures write the relevant tail into the run summary and upload the vcpkg logs, so a
 # broken run can be diagnosed from the summary alone without pulling raw job logs.
@@ -27,9 +27,13 @@ on:
 
 jobs:
   scaffold-and-build:
-    name: Scaffold an F4VR plugin and build it
-    runs-on: windows-2022
+    name: Scaffold + build (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-2022, windows-latest]
 
     steps:
       - uses: actions/checkout@v5
@@ -51,18 +55,17 @@ jobs:
           else { Write-Host 'No git identity set -- New-Plugin.ps1 must handle this itself.' }
           Write-Host "--- toolchain ---"
           cmake --version | Select-Object -First 1
-          # The presets pin the "Visual Studio 17 2022" generator and the v143 toolset, and
-          # CommonLibF4 does not compile under MSVC 14.5x (see the header). If this runner
-          # ever stops shipping a 17.x, the build breaks deep inside CommonLibF4 rather than
-          # anywhere obvious -- so say so loudly here instead.
+          # windows-vcpkg-vr pins no generator, so CMake takes whatever VS is here. Report it:
+          # the whole point of the matrix is that 17.x and 18.x both work, and knowing which
+          # one a given job used is the first thing you want if only one leg goes red.
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = @()
           if (Test-Path $vswhere) {
               $vs = @(& $vswhere -products '*' -property installationVersion)
           }
           Write-Host "Visual Studio installs: $($vs -join ', ')"
-          if (-not ($vs | Where-Object { $_ -like '17.*' })) {
-              Write-Host '::error::No Visual Studio 17.x on this runner; the presets require the 2022 generator and v143.'
+          if (-not $vs) {
+              Write-Host '::error::No Visual Studio on this runner at all; nothing can build.'
               exit 1
           }
           Write-Host "free space:"
@@ -74,8 +77,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/AppData/Local/vcpkg/archives
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('templates/f4sevr-plugin/vcpkg.json') }}
-          restore-keys: vcpkg-${{ runner.os }}-
+          key: vcpkg-${{ matrix.image }}-${{ hashFiles('templates/f4sevr-plugin/vcpkg.json') }}
+          restore-keys: vcpkg-${{ matrix.image }}-
 
       # Reuse the runner's preinstalled vcpkg when present. -NoEnv exists for exactly this
       # case: bootstrap without writing persistent user env vars.
@@ -120,7 +123,7 @@ jobs:
           Write-Host "scaffold commit: $log"
           exit 0
 
-      - name: Configure (vs2022-windows-vcpkg-vr)
+      - name: Configure (windows-vcpkg-vr)
         shell: powershell
         run: |
           # cmake and vcpkg write plenty to stderr; under this shell's EAP=stop a merged
@@ -128,7 +131,7 @@ jobs:
           $ErrorActionPreference = 'Continue'
           $logFile = Join-Path $env:RUNNER_TEMP 'configure.log'
           Set-Location (Join-Path $env:RUNNER_TEMP 'citest')
-          cmake --preset vs2022-windows-vcpkg-vr 2>&1 | Tee-Object -FilePath $logFile
+          cmake --preset windows-vcpkg-vr 2>&1 | Tee-Object -FilePath $logFile
           $rc = $LASTEXITCODE
           if ($rc -ne 0) {
               "## Configure failed (rc=$rc)"                    | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
@@ -203,7 +206,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-failure-logs
+          name: e2e-failure-logs-${{ matrix.image }}
           path: |
             ${{ runner.temp }}/configure.log
             ${{ runner.temp }}/build.log
@@ -213,7 +216,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: citest-f4vr-plugin
+          name: citest-f4vr-plugin-${{ matrix.image }}
           path: |
             ${{ runner.temp }}/citest/buildvr/Release/citest.dll
             ${{ runner.temp }}/citest/buildvr/Release/citest.pdb

@@ -51,31 +51,31 @@ set (different files in the build chain read different names).
 ```powershell
 .\New-Plugin.ps1 -Name <name> -Game F4VR [-Mo2Path <mo2 mod folder>]
 cd C:\repos\<name>
-cmake --preset vs2022-windows-vcpkg-vr    # or vr-mo2 if -Mo2Path was given
+cmake --preset windows-vcpkg-vr           # or vr-mo2 if -Mo2Path was given
 cmake --build buildvr --config Release
 ```
 
 First configure restores ~13 vcpkg ports and compiles CommonLibF4 — several minutes; that is
 normal. **Gate:** `buildvr/Release/<name>.dll` exists.
 
-**Toolchain trap — VS2022 (v143) is required; VS2026 does not work.** `00-prereqs.ps1`
-installs VS2022 for this reason. If the machine has only Visual Studio 18 / 2026 (MSVC
-14.5x), configure fails with `could not find any instance of Visual Studio` because the
-presets pin the `Visual Studio 17 2022` generator. Do **not** "fix" that by retargeting the
-generator: configure then succeeds and the build dies deep inside CommonLibF4 with ~14
-identical `C2440` errors at `RE/Havok/hkVector4.h`. The cause is upstream, not your project —
-`hkVector4f& GetNormalized() { hkVector4f norm = *this; ...; return norm; }` returns a
-reference to a local, and under C++23's P2266 a returned local is an rvalue, so it no longer
-binds to an lvalue reference. (It was always a dangling reference; MSVC 14.4x just accepted
-it.) Install VS2022 alongside whatever else is present and build with that.
+This gate proves VS + C++23, CMake, vcpkg, git submodules and the whole chain at once —
+everything after it is additive.
 
-The upstream fix is one line — return by value, `hkVector4f GetNormalized() const` — and it
-is verified: with that change the full chain (CommonLibF4 + plugin) builds clean under VS2026
-/ MSVC 14.51 and produces a valid x64 F4SE plugin. It is the only such site in the tree;
-`Normalize()` just above returns `*this`, a member, and is fine. Once that lands in
-rollingrock/CommonLibF4, the VS2022 pin here (and in `.github/workflows/e2e-build.yml`) can
-be relaxed. This gate proves VS2022+C++23, CMake,
-vcpkg, git submodules and the whole chain at once — everything after it is additive.
+**One DLL, three runtimes.** The submodule is [alandtse/CommonLibF4](https://github.com/alandtse/CommonLibF4),
+which dispatches at runtime: `ENABLE_FALLOUT_F4`/`_NG`/`_VR` are all ON by default, so a
+single build serves pre-NG Fallout 4, the Next-Gen update **and** Fallout 4 VR, choosing via
+`REL::Module` at load time. There is no `FALLOUTVR` define to set. `BUILD_FALLOUTVR` only
+picks the deploy target and build directory (`buildvr/` vs `build/`). Gate your own
+runtime-specific code on `REL::Module::IsVR()` / `IsNG()` / `IsF4()`, not on a compile-time
+macro.
+
+**Visual Studio version:** `windows-vcpkg-vr` takes whatever VS is installed. VS2022 and
+VS2026 are both verified to build the full chain; `vs2019`/`vs2022`/`vs2026` presets exist if
+you need to pin one. (Historical note, in case you meet it in an old checkout: the previous
+submodule — rollingrock/CommonLibF4 — could not compile on MSVC 14.5x, because
+`hkVector4f& GetNormalized()` returned a reference to a local and C++23's P2266 makes a
+returned local an rvalue, giving ~14 `C2440` errors in `RE/Havok/hkVector4.h`. alandtse's
+fork fixed that in `ba22620`.)
 
 To test in game: the DLL+PDB go in the mod's `F4SE/Plugins/` (automatic with the `vr-mo2`
 preset); copy the TOML from `Data/F4SE/Plugins/` next to it by hand. The game needs F4SEVR

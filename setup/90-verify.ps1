@@ -29,12 +29,10 @@ $vsVersions = @(if (Test-Path $vswhere) { & $vswhere -products '*' -requires Mic
 $vsOk = [bool]($vsVersions | Where-Object { [int]($_ -split '\.')[0] -ge 17 })
 $vsDetail = $vsVersions -join ', '
 if ($vsOk -and -not ($vsVersions | Where-Object { $_ -like '17.*' })) {
-    # Do NOT suggest just retargeting the generator here: configure then succeeds and the
-    # build dies deep inside CommonLibF4 instead. Under C++23's P2266 a returned local is an
-    # rvalue, so `hkVector4f& GetNormalized()` in RE/Havok/hkVector4.h fails with C2440 on
-    # MSVC 14.5x. VS2022 + v143 is the supported toolchain until that is fixed upstream.
-    $vsDetail += ' (no 17.x: VS2022 + v143 is required — CommonLibF4 does not compile on MSVC 14.5x)'
-    $vsOk = $false
+    # Not a failure: the default `windows-vcpkg-vr` preset pins no generator, so CMake takes
+    # whatever VS is installed, and alandtse/CommonLibF4 builds on both 17.x and 18.x. Only
+    # the explicitly pinned vs2022-* presets need a 17.x present.
+    $vsDetail += ' (no 17.x: use windows-vcpkg-vr, which is generator-agnostic; the vs2022-* presets need 17.x)'
 }
 Check 'toolchain' 'VS C++ workload (17+)' $vsOk $vsDetail
 
@@ -87,7 +85,7 @@ if ($BuildTest) {
         & (Join-Path $PSScriptRoot '..\New-Plugin.ps1') -Name $name -Game F4VR -Dir $tmp
         Push-Location (Join-Path $tmp $name)
         try {
-            cmake --preset vs2022-windows-vcpkg-vr | Out-Host
+            cmake --preset windows-vcpkg-vr | Out-Host
             if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
             cmake --build buildvr --config Release | Out-Host
             if ($LASTEXITCODE -ne 0) { throw 'build failed' }

@@ -1,13 +1,13 @@
 # starterplugin
 
 F4SEVR plugin scaffolded from [bethesda-modding-starter](https://github.com/rollingrock/bethesda-modding-starter).
-Build chain: CMake + vcpkg + [rollingrock/CommonLibF4](https://github.com/rollingrock/CommonLibF4) (NG-style — one lib for flat and VR) as the `external/CommonLibF4` submodule.
+Build chain: CMake + vcpkg + [alandtse/CommonLibF4](https://github.com/alandtse/CommonLibF4) (NG-style with runtime dispatch — one DLL for flat, Next-Gen and VR) as the `external/CommonLibF4` submodule.
 
 ## Building
 
 ```powershell
 git submodule update --init --recursive
-cmake --preset vs2022-windows-vcpkg-vr
+cmake --preset windows-vcpkg-vr
 cmake --build buildvr --config Release
 ```
 

@@ -7,9 +7,11 @@
     rollingrock's mods (CMake + vcpkg + CommonLib submodule).
 
     Games:
-      F4VR / F4  -> vendored templates/f4sevr-plugin (CommonLibF4 is NG-style: one template
-                    builds both. vs2022-windows-vcpkg-vr sets BUILD_FALLOUTVR=ON -> defines
-                    FALLOUTVR, builds into buildvr/; vs2022-windows-vcpkg sets it OFF -> build/)
+      F4VR / F4  -> vendored templates/f4sevr-plugin. alandtse/CommonLibF4 dispatches at
+                    runtime, so ONE DLL serves flat F4, Next-Gen and VR. windows-vcpkg-vr
+                    deploys to the VR install and builds into buildvr/; windows-vcpkg targets
+                    the flat install and builds into build/. Both take whatever Visual Studio
+                    is present; vs2019/vs2022/vs2026 variants exist if you need to pin one.
       SF         -> clones rollingrock/sfse-template (raw SFSE hello-world, CMake)
       SkyrimNG   -> not scaffolded here; prints pointers (most Skyrim devs already have a
                     CommonLibSSE-NG flow; see docs/GAME_MATRIX.md)
@@ -112,7 +114,7 @@ if ($Game -in 'F4VR', 'F4') {
     Push-Location $target
     try {
         Invoke-Git init --initial-branch=main | Out-Null
-        Invoke-Git submodule add https://github.com/rollingrock/CommonLibF4.git external/CommonLibF4
+        Invoke-Git submodule add https://github.com/alandtse/CommonLibF4.git external/CommonLibF4
         Invoke-Git submodule update --init --recursive
 
         if ($Mo2Path) {
@@ -123,7 +125,7 @@ if ($Game -in 'F4VR', 'F4') {
                 configurePresets = @(
                     [ordered]@{
                         name           = 'vr-mo2'
-                        inherits       = 'vs2022-windows-vcpkg-vr'
+                        inherits       = 'windows-vcpkg-vr'
                         cacheVariables = [ordered]@{ MO2_INSTALL_PATH = $mo2 }
                     }
                 )
@@ -141,7 +143,7 @@ if ($Game -in 'F4VR', 'F4') {
     }
     finally { Pop-Location }
 
-    $preset = if ($Mo2Path) { 'vr-mo2' } else { 'vs2022-windows-vcpkg-vr' }
+    $preset = if ($Mo2Path) { 'vr-mo2' } else { 'windows-vcpkg-vr' }
     Write-Host ''
     Write-Host "Done: $target"
     Write-Host 'Build it:'
@@ -151,10 +153,11 @@ if ($Game -in 'F4VR', 'F4') {
     if ($Game -eq 'F4') {
         Write-Host ''
         Write-Host 'NOTE (flat F4): use the flat preset instead of the VR one above:'
-        Write-Host '  cmake --preset vs2022-windows-vcpkg'
+        Write-Host '  cmake --preset windows-vcpkg'
         Write-Host '  cmake --build build --config Release'
-        Write-Host 'It sets BUILD_FALLOUTVR=OFF (no FALLOUTVR define) and builds into build/ rather'
-        Write-Host 'than buildvr/; rollingrock/CommonLibF4 builds both from one tree (NG-style).'
+        Write-Host 'That sets BUILD_FALLOUTVR=OFF, so it deploys to the flat install and builds into'
+        Write-Host 'build/ rather than buildvr/. The DLL itself is identical either way -- CommonLibF4'
+        Write-Host 'picks the runtime at load time, so one build already works on F4, NG and VR.'
     }
 }
 elseif ($Game -eq 'SF') {

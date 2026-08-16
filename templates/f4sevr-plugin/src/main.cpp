@@ -33,8 +33,15 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a
 		return false;
 	}
 
+	// CommonLibF4 dispatches between three runtimes, so gate against the right minimum for
+	// whichever one loaded us. A two-way IsF4()/else test gets this wrong: on pre-NG Fallout 4
+	// IsF4() is true and comparing against RUNTIME_LATEST (1.10.984, the Next-Gen build)
+	// rejects a perfectly supported 1.10.163.
 	const auto ver = a_f4se->RuntimeVersion();
-	if (ver < (REL::Module::IsF4() ? F4SE::RUNTIME_LATEST : F4SE::RUNTIME_LATEST_VR)) {
+	const auto minimum = REL::Module::IsVR()  ? F4SE::RUNTIME_LATEST_VR :  // 1.2.72
+	                     REL::Module::IsNG()  ? F4SE::RUNTIME_1_10_984  :  // Next-Gen
+	                                            F4SE::RUNTIME_1_10_163;    // pre-NG flat
+	if (ver < minimum) {
 		logger::critical(FMT_STRING("Unsupported runtime version {}"), ver.string());
 		return false;
 	}
