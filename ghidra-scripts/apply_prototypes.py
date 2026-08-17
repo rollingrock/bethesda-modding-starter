@@ -154,6 +154,48 @@ def sanitize_identifier(member: str) -> str:
     return ident
 
 
+# Names Ghidra's SIGNATURE PARSER cannot resolve, and what to use instead.
+#
+# This is not about missing types -- it is about AMBIGUOUS ones. Importing CommonLibF4
+# created a second definition of several primitives, so the program holds both `/bool` and
+# `/CommonLibF4/bool`, both `/wchar_t` (2 bytes) and `/CommonLibF4/wchar_t` (1 byte, a
+# stub). Faced with two, the parser refuses rather than guessing -- which is the right call,
+# since picking `/CommonLibF4/int` (1 byte) over `/int` (4 bytes) would silently truncate
+# every int parameter in the program.
+#
+# The trap is that `bool` is exactly what Ghidra's own decompiler reports as an inferred
+# return type, so echoing its inference straight back fails. Measured: 1,904 of 2,027 apply
+# failures were `bool` or `bool *`.
+#
+# A qualified path does NOT help -- "/bool" fails the same way. Verified against the live
+# program: bool FAIL, /bool FAIL, byte OK, uchar OK, undefined1 OK, wchar_t FAIL,
+# wchar16 OK, __int64 FAIL, longlong OK, ulonglong OK.
+#
+# Where an exact-width equivalent exists it is used (no information lost). For `bool` there
+# is no unambiguous boolean, so it maps to undefined1 -- Ghidra treats `undefined*` as
+# "this many bytes, please infer", which lets the decompiler recover bool-ness itself
+# rather than being pinned to a wrong concrete type.
+PARSER_SAFE = {
+    "bool": "undefined1",
+    "wchar_t": "wchar16",
+    "__int64": "longlong",
+    "unsigned __int64": "ulonglong",
+    "unsigned___int64": "ulonglong",
+    "__int32": "int",
+    "__int16": "short",
+    "__int8": "char",
+}
+
+
+def parser_safe(type_name: str) -> str:
+    """Rewrite a type name into one Ghidra's signature parser will accept."""
+    t = type_name.strip()
+    m = re.match(r"^(.*?)(\s*\**)$", t)
+    base, ptr = (m.group(1).strip(), m.group(2).replace(" ", "")) if m else (t, "")
+    fixed = PARSER_SAFE.get(base, base)
+    return (fixed + " " + ptr).strip() if ptr else fixed
+
+
 # A struct this small is a forward-declared placeholder, not a real layout. Ghidra stores
 # uninstantiated templates that way -- NiPointer, BSTSmartPointer, CArgs and StreamRequest
 # are all 1 byte. Pointing a parameter at one is worse than leaving it undefined: the
@@ -493,9 +535,9 @@ def build_prototype(c: dict, this_kind: str, fill_unresolved: bool,
             # Unknown aggregate -> an opaque pointer. `void *` is honest; a wrong named
             # struct would make the decompiler confidently misreport field offsets.
             ty, stars = "void", max(stars, 1)
-        params.append(f"{ty} {'*' * stars} a_{i}".replace("  ", " "))
+        params.append(f"{parser_safe(ty)} {'*' * stars} a_{i}".replace("  ", " "))
     inner = ", ".join(params) if params else "void"
-    return f"{ret} {sanitize_identifier(c['member'])}({inner})"
+    return f"{parser_safe(ret)} {sanitize_identifier(c['member'])}({inner})"
 
 
 def phase_report(args) -> None:
@@ -561,6 +603,26 @@ def phase_report(args) -> None:
 def phase_apply(args) -> None:
     with open(cache_path(args, "plan.json"), encoding="utf-8") as fh:
         plan = json.load(fh)
+    if args.retry_failed:
+        # Re-run only what the journal shows did NOT apply. Uses the CURRENT plan, so a fix
+        # to type mapping or this-detection is picked up; re-applying a success would be
+        # harmless but wastes ~250 ms each, and there are usually far more of those.
+        jpath = cache_path(args, "journal.jsonl")
+        if not os.path.exists(jpath):
+            raise SystemExit("--retry-failed needs journal.jsonl; nothing has been applied yet.")
+        failed_addrs = set()
+        with open(jpath, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if (rec.get("result") or {}).get("status") != "success":
+                    failed_addrs.add(rec["address"])
+                else:
+                    failed_addrs.discard(rec["address"])   # a later success supersedes
+        plan = [p for p in plan if p["address"] in failed_addrs]
+        print(f"retrying {len(plan):,} that did not apply")
     if args.tier:
         plan = [p for p in plan if p["tier"] == args.tier]
     if args.limit:
@@ -572,6 +634,8 @@ def phase_apply(args) -> None:
         print(f"APPLYING {len(plan):,} prototypes. Journal: {cache_path(args, 'journal.jsonl')}")
 
     ok = bad = failed = 0
+    applied = rejected_on_apply = 0
+    apply_errors: Counter = Counter()
     jpath = cache_path(args, "journal.jsonl")
     journal = open(jpath, "a", encoding="utf-8") if args.apply else None
     try:
@@ -599,7 +663,22 @@ def phase_apply(args) -> None:
                         "prototype": row["prototype"],
                         "calling_convention": args.calling_convention,
                     }, timeout=120)
-                    journal.write(json.dumps({**row, "result": json.loads(res)}) + "\n")
+                    parsed_res = json.loads(res)
+                    # VALIDATION IS NOT A PREDICTION OF APPLICATION. They take different
+                    # resolution paths: /validate_function_prototype answered {"valid":true}
+                    # for 2,027 prototypes that /set_function_prototype then rejected with
+                    # "Can't resolve datatype". Counting only validation reported a clean run
+                    # while 15.5% of the writes had silently failed -- so the APPLY result is
+                    # what gets counted here.
+                    if parsed_res.get("status") == "success":
+                        applied += 1
+                    else:
+                        rejected_on_apply += 1
+                        reason = str(parsed_res.get("error", "unknown"))
+                        apply_errors[re.sub(r".*resolve (?:return type|datatype): ", "", reason)[:60]] += 1
+                        if rejected_on_apply <= 5:
+                            print(f"  APPLY FAILED {row['name'][:56]}\n          {reason[:120]}")
+                    journal.write(json.dumps({**row, "result": parsed_res}) + "\n")
                     # Flush every line. The journal is the ONLY record of what was written
                     # to the database, so buffering it means a crash loses exactly the
                     # information needed to know how far the run got -- which is the one
@@ -609,7 +688,8 @@ def phase_apply(args) -> None:
                 except Exception as exc:               # noqa: BLE001
                     failed += 1
             if (i + 1) % 250 == 0:
-                print(f"  {i + 1:,}/{len(plan):,}  valid={ok:,} invalid={bad:,} errors={failed:,}",
+                extra = f" APPLIED={applied:,} apply-failed={rejected_on_apply:,}" if args.apply else ""
+                print(f"  {i + 1:,}/{len(plan):,}  valid={ok:,} invalid={bad:,} errors={failed:,}{extra}",
                       flush=True)
     finally:
         if journal:
@@ -619,8 +699,18 @@ def phase_apply(args) -> None:
     print(f"validated OK : {ok:,}")
     print(f"rejected     : {bad:,}")
     print(f"errors       : {failed:,}")
-    if not args.apply:
+    if args.apply:
+        print(f"APPLIED      : {applied:,}")
+        print(f"apply-failed : {rejected_on_apply:,}")
+        for reason, n in apply_errors.most_common(10):
+            print(f"    {n:6,}  {reason}")
+        if rejected_on_apply:
+            print("\nThose functions were NOT changed. Their prototypes validated but could not")
+            print("be applied -- the two use different type-resolution paths.")
+    else:
         print("\nNothing was written. Re-run with --apply to commit.")
+        print("NOTE: validating is not the same as applying. Some prototypes that validate")
+        print("      are still rejected on apply; only --apply reports that.")
 
 
 def main() -> int:
@@ -643,6 +733,8 @@ def main() -> int:
                          "1-byte placeholder stubs, and a wrong struct is worse than none.")
     ap.add_argument("--calling-convention", default="__fastcall")
     ap.add_argument("--apply", action="store_true", help="actually write (default is a dry run)")
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="apply only the entries the journal shows did not apply")
     args = ap.parse_args()
 
     os.makedirs(args.cache_dir, exist_ok=True)
