@@ -217,8 +217,12 @@ jobs:
           Write-Host '::endgroup::'
 
           Write-Host '::group::-Status / -Stop'
+          # Gate on -Status, do not merely run it -- see the same block in ghidra-bringup.yml.
+          # Unchecked, this exit code was overwritten by the -Stop below before anything read it.
           .\setup\36-ghidra-mcp.ps1 -Status
+          if ($LASTEXITCODE -ne 0) { throw "-Status did not meet the documented Phase 4 gate (exit $LASTEXITCODE)." }
           .\setup\36-ghidra-mcp.ps1 -Stop
+          if ($LASTEXITCODE -ne 0) { throw "-Stop reported failure (exit $LASTEXITCODE)." }
           Start-Sleep -Seconds 3
           # A JVM left alive is what strands a project lock and blocks every later run.
           $alive = @(Get-Process java, javaw -ErrorAction SilentlyContinue)

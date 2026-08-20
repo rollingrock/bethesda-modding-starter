@@ -230,8 +230,15 @@ jobs:
           Write-Host '::endgroup::'
 
           Write-Host '::group::-Status / -Stop'
+          # Gate on -Status, do not merely run it. CLAUDE.md states the Phase 4 gate as a live
+          # connection AND a non-zero tool count AND a loaded program, and 36 enforces all three
+          # by exit code now. Left unchecked, that code was overwritten by the -Stop below before
+          # anything read it, so the one assertion this leg exists to make was discarded -- the
+          # same muted-alarm shape the probe_bridge tool floor was fixed for.
           .\setup\36-ghidra-mcp.ps1 -Status
+          if ($LASTEXITCODE -ne 0) { throw "-Status did not meet the documented Phase 4 gate (exit $LASTEXITCODE)." }
           .\setup\36-ghidra-mcp.ps1 -Stop
+          if ($LASTEXITCODE -ne 0) { throw "-Stop reported failure (exit $LASTEXITCODE)." }
           Start-Sleep -Seconds 3
           # A JVM left alive is what strands a project lock and blocks every later run.
           $alive = @(Get-Process java, javaw -ErrorAction SilentlyContinue)

@@ -22,12 +22,44 @@
     (README also documents a /server_status endpoint for headless; `server_status` appears
     nowhere in the Java source and returns 404. Don't rely on it.)
 
+    EXIT CODES. Agents and CI gate on these, so each one means exactly one thing, and 0 is
+    the narrow one: it asserts the state you ASKED FOR now holds, not that this script
+    reached its last line.
+      0  The server is up, it exposes its MCP toolset, it is holding the program you named,
+         and any .mcp.json you asked for describes THIS server.
+      1  You have no usable server. Nothing came up, something refused (a project lock this
+         script will not break, a -Stop that would have thrown away unsaved database work),
+         or what did come up exposes no MCP tools at all - the bridge would connect to it
+         and register nothing.
+      2  The server is up and exposing its tools, but the state is NOT the one you asked
+         for: no program where you asked for one (a locked project, or a --program Ghidra
+         printed a failure for and then ignored), a different program than the one you
+         named, or a .mcp.json already on disk that points somewhere else. Everything is
+         running and usable for whatever IS loaded - and the JVM still has to be stopped -
+         which is why this is deliberately not 1. A caller that gates on `-eq 0` treats 1
+         and 2 alike and is right to; only a caller that wants to say "it is up, just not
+         loaded" has to tell them apart.
+
 .PARAMETER Project
     Ghidra project to open -- a .gpr path or the directory containing one. Defaults to
     BethesdaGhidraScripts' project, i.e. the database the enrichment pipeline built.
 
 .PARAMETER Program
     Program inside the project to load, e.g. /f4/vr/Fallout4VR.exe.unpacked.exe.
+
+.PARAMETER WriteMcpConfigTo
+    Directory to write .mcp.json into, so an agent session started there gets the tools.
+    The file carries BOTH servers - ghidra and x64dbg - because it is built by
+    New-McpConfigObject in setup\_common.ps1, which is the one definition of that file's
+    shape; this script used to build its own inline with the x64dbg server missing.
+
+    If a .mcp.json is already there this COMPARES the two and prints what differs. That is
+    not an edge case: New-Plugin.ps1 scaffolds a .mcp.json into every project, so the
+    documented Phase 4 command always lands on an existing file, and the old behaviour
+    (print the JSON, say "merge this in yourself", exit 0) meant the interesting half was
+    never even looked at. A file describing a different server is a real failure - a stale
+    port pin is how an agent session ends up talking to nothing - so a difference exits 2.
+    -Force replaces the file instead.
 
 .EXAMPLE
     .\36-ghidra-mcp.ps1 -Start -Program /f4/vr/Fallout4VR.exe.unpacked.exe
@@ -56,6 +88,10 @@ param(
     # failed (you accept losing whatever the MCP tools changed since the last save, plus a
     # stale project .lock), or one where something is serving the port but no PID record here
     # proves we started it (we still only ask it to exit over HTTP -- see the -Stop path).
+    # On -Start it means one more thing: replace a .mcp.json that already exists and describes
+    # a different server. That is refused by default because the file belongs to the project
+    # you pointed at, not to us -- it may carry MCP servers nothing here knows about, and the
+    # replacement is REGENERATED from this pack's two servers, not merged with them.
     # Deliberately outside the parameter sets, like -Root and -Port, so it applies to any mode.
     [switch]$Force
 )
@@ -83,6 +119,19 @@ if (Test-Path $legacyPidFile) {
     Write-Host "Discarding pre-port-scoped PID record $legacyPidFile (a bare number cannot identify a process)."
     Remove-Item $legacyPidFile -Force -ErrorAction SilentlyContinue
 }
+# What the server on this port was told to LOAD, recorded beside the PID record and scoped to
+# the same port. -Status needs it to tell apart two states that look identical over HTTP: a
+# server started with no program ON PURPOSE (a bare -Start, or the locked-project path below,
+# which deliberately starts without a project) and a server that was asked for a program and
+# does not have it. /get_metadata answers "No program loaded" to both, so with nothing recorded
+# -Status could only ever pass a useless server or fail a healthy one -- and it chose to pass.
+# A SEPARATE file from the PID record on purpose: that record answers "which process is
+# provably ours" and is the single check standing between both force-kill sites and a stranger's
+# process, so it is not a place to hang new fields on.
+# Nothing has to clean this one up. Get-LoadRecord hands it back only while its pid and start
+# time still match the live process Get-ServerPid proved is ours, so a record left behind by a
+# stopped server describes nothing and is ignored; the next -Start on this port overwrites it.
+$loadFile = Join-Path $stateDir ".ghidra-headless.$Port.load.json"
 $outLog = Join-Path $stateDir '.ghidra-headless.out.log'
 $errLog = Join-Path $stateDir '.ghidra-headless.err.log'
 $manifestPath = Join-Path $stateDir '.ghidra-mcp-build.json'
@@ -157,6 +206,189 @@ function Get-ServerPid {
     # inherits the ambiguity and mistakes it for a server it can kill.
     if (-not $ours) { Remove-Item $pidFile -ErrorAction SilentlyContinue }
     return $ours
+}
+
+# The load record -Start writes the moment it launches the JVM, handed back ONLY while it still
+# describes the live server. Pass the process Get-ServerPid already proved is ours: the record
+# repeats that process's pid and start time, so a file left over from an earlier server on this
+# port -- nothing deletes it on -Stop, and it must not need to -- fails to match and is ignored
+# rather than answering for a server it knows nothing about. Same fail-safe rule as the PID
+# record: anything we cannot prove is current is treated as absent.
+function Get-LoadRecord {
+    [CmdletBinding()]
+    param($Server)
+    if (-not $Server) { return $null }
+    if (-not (Test-Path $loadFile)) { return $null }
+    try {
+        $rec = (Get-Content $loadFile -Raw) | ConvertFrom-Json
+        $recPid = 0
+        if (-not ([int]::TryParse([string]$rec.pid, [ref]$recPid))) { return $null }
+        if ($recPid -ne $Server.Id) { return $null }
+        $recorded = [datetime]::Parse([string]$rec.startedUtc, [Globalization.CultureInfo]::InvariantCulture)
+        $delta = ($Server.StartTime.ToUniversalTime() - $recorded.ToUniversalTime()).TotalSeconds
+        if ([Math]::Abs($delta) -gt 2) { return $null }
+        return $rec
+    }
+    catch { return $null }
+}
+
+# /get_metadata answers a FLAT object -- program_name, executable_path, function_count and the
+# rest -- or {"error":"No program loaded."}; it is not the {"data":...} envelope some other
+# endpoints use. Read program_name out of it, and return '' rather than guessing when the body
+# will not parse: an unreadable answer must never be turned into "the wrong program is loaded",
+# because the caller acts on that by exiting 2 against a server that may be perfectly right.
+function Get-MetadataProgramName([string]$body) {
+    if (-not $body) { return '' }
+    try {
+        $j = $body | ConvertFrom-Json
+        return "$($j.program_name)".Trim()
+    }
+    catch { return '' }
+}
+
+# The leaf of what the caller asked to load, which is the only thing comparable to what the
+# server reports. A -Program is a path INSIDE the Ghidra project (/f4/vr/Fallout4VR.exe.unpacked.exe)
+# and a -File is a path on disk, while program_name is just the name Ghidra gave the program --
+# so the folder halves have nothing in common and only the last segment can be held up against
+# it. Split on both separators: the project path uses forward slashes, the disk path backslashes.
+function Get-RequestedProgramLeaf([string]$request) {
+    if (-not $request) { return '' }
+    $flat = ($request -replace '\\', '/').TrimEnd('/')
+    if (-not $flat) { return '' }
+    return $flat.Split('/')[-1]
+}
+
+# --------------------------------------------------------------- .mcp.json (write or compare)
+# Returns $true when the file on disk now describes THIS server, $false when it does not and we
+# refused to overwrite it -- the caller turns that into the exit code, because "I ran the config
+# branch" is not the same claim as "the config the agent will load points here".
+#
+# The caller has already checked that $Directory exists (that check runs before the JVM starts,
+# so a typo cannot leave a server running behind a failed run).
+function Write-McpConfigFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [string]$BridgeExe = ''
+    )
+
+    # Pinned to a provider path before anything writes to it. The write below goes through
+    # [IO.File], which is .NET and resolves a relative path against the PROCESS working
+    # directory -- a thing Set-Location and Push-Location never change -- so a relative
+    # -WriteMcpConfigTo would be compared in one directory and written in another. Same
+    # reasoning as New-Plugin.ps1's $target; when the path is already absolute this is a no-op.
+    $target = Join-Path ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Directory)) '.mcp.json'
+    # ONE definition of this file's shape, in _common.ps1, consumed by every writer. There used
+    # to be two that disagreed in both directions: this script built the object inline with the
+    # paths correctly resolved and NO x64dbg server in it, while mcp/mcp.template.json carried
+    # both servers and a hard-coded C:/repos bridge path that New-Plugin.ps1 copied verbatim into
+    # every scaffold. Each file was the fix for the other one's bug and neither knew it.
+    # -BridgeExe hands over the path this run already read out of the build manifest, and -Port
+    # is the port this invocation is actually serving on -- which is the whole 8089-vs-8090 trap:
+    # follow this script's own advice to use -Port when 8089 is busy, and a config generated with
+    # the default pins the bridge to a port nothing is listening on.
+    $cfg = New-McpConfigObject -Port $Port -BridgeExe $BridgeExe
+    $wantCommand = "$($cfg.mcpServers.ghidra.command)"
+    $wantUrl = "$($cfg.mcpServers.ghidra.env.GHIDRA_MCP_URL)"
+    $wantX64 = (@($cfg.mcpServers.x64dbg.args) -join ' ')
+
+    if (-not (Test-Path $target)) {
+        # UTF-8 with NO BOM, via the same [IO.File]::WriteAllText call New-Plugin.ps1 and
+        # 30-ghidra.ps1 use for the files they generate -- and NOT Set-Content -Encoding UTF8,
+        # which under Windows PowerShell 5.1 emits a BOM. A U+FEFF in front of the opening brace
+        # is not cosmetic here: JSON.parse rejects it, so an MCP client reading this file finds
+        # NO servers at all. That is precisely the failure this whole branch exists to prevent --
+        # a Phase 4 run that exits 0 over an agent session with no Ghidra tools in it -- and it
+        # would also have quietly re-broken every .mcp.json New-Plugin.ps1 wrote BOM-less.
+        [IO.File]::WriteAllText($target, (($cfg | ConvertTo-Json -Depth 6) + "`r`n"), [Text.UTF8Encoding]::new($false))
+        Write-Host "Wrote $target - restart your agent session there to pick up both servers:"
+        Write-Host "  ghidra: $wantCommand"
+        Write-Host "          pinned to $wantUrl (headless serves no /mcp/instance_info, so"
+        Write-Host '          bridge discovery finds nothing without that pin)'
+        Write-Host "  x64dbg: cmd $wantX64"
+        Write-Host '          (the debugger-side plugin is setup\40-x64dbg.ps1; the version above'
+        Write-Host '          and the plugin it installs come from one pin in setup\_common.ps1)'
+        return $true
+    }
+
+    # An existing file is the NORMAL case: New-Plugin.ps1 puts a .mcp.json in every project it
+    # scaffolds, so `-WriteMcpConfigTo <your-plugin-dir>` -- the Phase 4 command in CLAUDE.md --
+    # always lands here. This branch used to print the JSON, say "merge this in yourself" and
+    # exit 0 without so much as reading the file, so a stale port, a bridge exe from another
+    # checkout, or an entry left by a different Ghidra MCP extension entirely (GhidraMCP vs
+    # GhidrAssistMCP is a confusion that has really happened) all survived a successful run.
+    Write-Host "$target already exists; comparing it against what this run would write."
+    $have = $null
+    $readError = ''
+    try { $have = Get-Content $target -Raw -ErrorAction Stop | ConvertFrom-Json }
+    catch { $readError = $_.Exception.Message }
+
+    $diffs = [System.Collections.Generic.List[string]]::new()
+    $unreadable = ($readError -or -not $have)
+    if ($unreadable) {
+        $reason = if ($readError) { $readError } else { 'it parsed to nothing' }
+        Write-Host "  UNREADABLE: $reason"
+        Write-Host '  A .mcp.json an agent cannot parse is a .mcp.json that loads no servers at all.'
+        $diffs.Add('unreadable file')
+    }
+    else {
+        # Compare the command as a PATH, not as a string. mcp/mcp.template.json writes it with
+        # forward slashes and the build manifest records backslashes; Windows spawns the same exe
+        # either way, so a textual compare would report DIFFERS on a file that works perfectly --
+        # and a check that cries wolf on the common case is one people learn to ignore.
+        $haveCommand = "$($have.mcpServers.ghidra.command)".Trim()
+        $haveUrl = "$($have.mcpServers.ghidra.env.GHIDRA_MCP_URL)".Trim()
+        $haveX64 = (@($have.mcpServers.x64dbg.args) -join ' ').Trim()
+        if (($haveCommand -replace '/', '\') -eq ($wantCommand -replace '/', '\')) {
+            Write-Host "  ghidra command   MATCHES  $wantCommand"
+        }
+        else {
+            Write-Host '  ghidra command   DIFFERS'
+            Write-Host "    on disk:     $(if ($haveCommand) { $haveCommand } else { '(no mcpServers.ghidra.command)' })"
+            Write-Host "    this server: $wantCommand"
+            $diffs.Add('ghidra command')
+        }
+        if ($haveUrl.TrimEnd('/') -eq $wantUrl.TrimEnd('/')) {
+            Write-Host "  GHIDRA_MCP_URL   MATCHES  $wantUrl"
+        }
+        else {
+            Write-Host '  GHIDRA_MCP_URL   DIFFERS'
+            Write-Host "    on disk:     $(if ($haveUrl) { $haveUrl } else { '(no mcpServers.ghidra.env.GHIDRA_MCP_URL)' })"
+            Write-Host "    this server: $wantUrl"
+            $diffs.Add('GHIDRA_MCP_URL')
+        }
+        if ($haveX64 -eq $wantX64) {
+            Write-Host "  x64dbg server    MATCHES  cmd $wantX64"
+        }
+        else {
+            Write-Host '  x64dbg server    DIFFERS'
+            Write-Host "    on disk:     $(if ($haveX64) { "cmd $haveX64" } else { '(no mcpServers.x64dbg entry)' })"
+            Write-Host "    this pack:   cmd $wantX64"
+            $diffs.Add('x64dbg server')
+        }
+    }
+
+    if ($diffs.Count -eq 0) {
+        Write-Host '  Already describes this server; nothing to write.'
+        return $true
+    }
+    if ($Force) {
+        # No BOM, for the reason spelled out at the fresh-write above.
+        [IO.File]::WriteAllText($target, (($cfg | ConvertTo-Json -Depth 6) + "`r`n"), [Text.UTF8Encoding]::new($false))
+        Write-Host "  -Force: replaced $target. It is REGENERATED, not merged -- any other MCP"
+        Write-Host '  server you had added to that file is gone, so add it back to the new one.'
+        return $true
+    }
+    Write-Host "  Leaving $target alone: it is your project's file, and a regenerated one carries"
+    Write-Host '  only this pack''s two servers -- anything else you put in it would be dropped.'
+    if ($unreadable) {
+        Write-Host '  Fix the JSON by hand, or re-run with -Force to replace the file wholesale.'
+    }
+    else {
+        Write-Host '  Correct these by hand, or re-run with -Force to replace the file wholesale:'
+        Write-Host "    $($diffs -join ', ')"
+    }
+    return $false
 }
 
 # --------------------------------------------------------------------------- Stop
@@ -253,16 +485,106 @@ if ($Stop) {
 if ($Status) {
     $p = Get-ServerPid
     $conn = Invoke-Endpoint '/check_connection'
+    $toolCount = -1
+    $meta = $null
+    # What this server was started to load, or $null when nothing here can vouch for it.
+    $load = Get-LoadRecord -Server $p
+    $wantedLoad = ''
+    if ($load) {
+        if ("$($load.file)".Trim()) { $wantedLoad = "$($load.file)".Trim() }
+        elseif ("$($load.program)".Trim()) { $wantedLoad = "$($load.program)".Trim() }
+    }
     $rows = [System.Collections.Generic.List[object]]::new()
     $rows.Add([pscustomobject]@{ Check = 'process'; Result = $(if ($p) { "running (PID $($p.Id))" } else { 'not running' }) })
     $rows.Add([pscustomobject]@{ Check = 'check_connection'; Result = $(if ($conn.Ok) { $conn.Body.Trim() } else { "unreachable: $($conn.Body)" }) })
     if ($conn.Ok) {
-        $rows.Add([pscustomobject]@{ Check = 'mcp tools'; Result = "$(Get-ToolCount) exposed via /mcp/schema" })
+        # -1 is Get-ToolCount's "/mcp/schema did not answer", not a count. Printed as
+        # "-1 exposed via /mcp/schema" it read like one, which is exactly the row an agent
+        # skims past on its way to an exit 0 that meant nothing.
+        $toolCount = Get-ToolCount
+        $rows.Add([pscustomobject]@{ Check = 'mcp tools'; Result = $(if ($toolCount -lt 0) { 'UNREADABLE - /mcp/schema did not answer' } else { "$toolCount exposed via /mcp/schema" }) })
         $meta = Invoke-Endpoint '/get_metadata' 30
         $rows.Add([pscustomobject]@{ Check = 'program'; Result = $(if ($meta.Ok) { ($meta.Body -replace '\s+', ' ').Substring(0, [Math]::Min(160, ($meta.Body -replace '\s+', ' ').Length)) } else { 'n/a' }) })
+        $rows.Add([pscustomobject]@{ Check = 'started to load'; Result = $(if ($wantedLoad) { $wantedLoad } elseif ($load) { 'nothing - started without a program on purpose' } else { 'unknown - no load record here matches this process' }) })
     }
     $rows | Format-Table -AutoSize
-    exit $(if ($conn.Ok) { 0 } else { 1 })
+
+    # THE GATE, and it is a conjunction on purpose. CLAUDE.md states Phase 4 as "-Status reports
+    # a live connection, a non-zero tool count, and a loaded program", but the exit code was the
+    # connection alone -- so a server whose /mcp/schema answered nothing and whose program row
+    # said 'n/a' still exited 0, and the agent that gated on it went off to decompile against
+    # "No program loaded". A table nobody reads is not a gate; the exit code is.
+    if (-not $conn.Ok) {
+        Write-Host "Nothing is answering on $baseUrl. Start it with: .\setup\36-ghidra-mcp.ps1 -Start"
+        exit 1
+    }
+    if ($toolCount -lt 0) {
+        # Not the same failure as "zero tools", and worth its own sentence: /mcp/schema IS the
+        # toolset. The bridge fetches it and registers whatever it finds, so a server that will
+        # not serve it hands an agent nothing, however healthy /check_connection looks.
+        Write-Host 'The server answers /check_connection, but /mcp/schema did not answer at all - and'
+        Write-Host 'that schema is the toolset the bridge registers from. -Stop then -Start it.'
+        exit 1
+    }
+    if ($toolCount -lt 1) {
+        Write-Host 'The server answers, but exposes no MCP tools - the bridge would connect to it and'
+        Write-Host 'register nothing, so there is no toolset for an agent to reach. -Stop then -Start it.'
+        exit 1
+    }
+    # "A loaded program WHEN ONE IS IMPLIED", and the load record is how that is decided, because
+    # over HTTP the two cases are identical: /get_metadata says "No program loaded" both to a
+    # server that was never given one and to a server whose --program Ghidra printed a failure
+    # for and then ignored. So -Status holds this server to what it was STARTED to load. A bare
+    # -Start, or the locked-project path that deliberately starts WITHOUT a project, recorded no
+    # program and is not broken -- calling it broken would fail precisely the runs this script
+    # chose to allow. (-Start answers the other question, "did the CALLER get what they asked
+    # for", and does exit 2 when a locked project cost you the -Program you named. One server,
+    # two honest answers: one about the request, one about the server.)
+    #
+    # With no record at all -- another checkout's server, one started before this script recorded
+    # this, or one whose record no longer matches the live process -- nothing here knows what was
+    # asked for. That is judged NOT passed rather than passed: a server holding no program cannot
+    # answer a single decompile, and this exit code is what an agent uses to decide it may start.
+    $programLoaded = $false
+    if ($meta -and $meta.Ok -and ($meta.Body -notmatch 'No program loaded')) { $programLoaded = $true }
+    if (-not $programLoaded) {
+        if ($load -and -not $wantedLoad) {
+            Write-Host 'No program is loaded, and none was asked for when this server was started'
+            Write-Host '(a bare -Start, or a locked project). Nothing is wrong with the server -- but'
+            Write-Host 'an agent that needs a program still has to -Stop it and -Start it with -Program.'
+            exit 0
+        }
+        if (-not ($meta -and $meta.Ok)) {
+            # /get_metadata did not ANSWER, which is a different fact from "No program loaded"
+            # and must not be reported as it. The endpoint gets 30 s above, and a JVM in the
+            # middle of a decompile can hold it longer -- so the honest statement is that
+            # nothing here knows what is loaded. This is the same rule the already-running
+            # comparison further down applies to an unreadable program_name: an answer we could
+            # not read is never turned into a claim about the wrong state. The exit code is
+            # unchanged (2, the same one both branches below take) because a server that will
+            # not say what it holds is still not something an agent can gate on -- only the
+            # sentence and the repair change.
+            Write-Host "/get_metadata did not answer ($($meta.Body)), so what this server is holding"
+            Write-Host 'could not be read at all. That is NOT the same as "no program loaded", and this'
+            Write-Host 'gate will not claim it is.'
+            Write-Host 'The Phase 4 gate is NOT passed: re-run -Status once the JVM is idle; if it still'
+            Write-Host 'will not answer, -Stop and -Start it.'
+            exit 2
+        }
+        if ($wantedLoad) {
+            Write-Host "This server was started to load '$wantedLoad' and is holding NO program."
+            Write-Host 'Ghidra prints --project/--program failures and carries on, so it comes up'
+            Write-Host 'healthy and empty and every tool call returns "No program loaded".'
+        }
+        else {
+            Write-Host 'No program is loaded, and nothing here recorded what this server was started to'
+            Write-Host "load (no load record for port $Port matches this process) - it was started from"
+            Write-Host 'another checkout, or before this script kept that record.'
+        }
+        Write-Host 'The Phase 4 gate is NOT passed: -Stop, then -Start with the -Program you need.'
+        exit 2
+    }
+    exit 0
 }
 
 # --------------------------------------------------------------------------- Start
@@ -270,13 +592,83 @@ $manifest = Get-Manifest
 if (-not (Test-Path $manifest.headlessCpFile)) {
     throw "Classpath argfile $($manifest.headlessCpFile) is missing - re-run setup\30-ghidra.ps1."
 }
+# Judge -WriteMcpConfigTo BEFORE anything is started. This check used to sit at the very end,
+# after the JVM was up: a typo in the directory threw on a run that had already printed "Up:",
+# leaving a server (and a project lock) behind a failure.
+if ($WriteMcpConfigTo -and -not (Test-Path $WriteMcpConfigTo)) {
+    throw "-WriteMcpConfigTo '$WriteMcpConfigTo' does not exist."
+}
 
 $existing = Get-ServerPid
 if ($existing) {
     $conn = Invoke-Endpoint '/check_connection'
     if ($conn.Ok) {
         Write-Host "Already running (PID $($existing.Id)): $($conn.Body.Trim())"
+
+        # The requested config is written on THIS path too. This branch used to exit 0 two
+        # hundred lines above the .mcp.json block, so `-Start -Program ... -WriteMcpConfigTo
+        # <dir>` -- the exact Phase 4 command CLAUDE.md gives -- silently wrote nothing whenever
+        # a server happened to be up already, said nothing about it, and reported success. A run
+        # that was asked for a config and did not write one must never exit 0.
+        $configOk = $true
+        if ($WriteMcpConfigTo) {
+            $configOk = Write-McpConfigFile -Directory $WriteMcpConfigTo -BridgeExe "$($manifest.bridgeExe)"
+        }
+
+        # Up is not the same as usable, and this path never asked. The tool count is what an
+        # agent actually receives: a server whose /mcp/schema is empty registers nothing through
+        # the bridge, and "Already running" over the top of that is a lie the caller acts on.
+        $toolCount = Get-ToolCount
+        Write-Host "MCP tools exposed: $toolCount"
+        if ($toolCount -lt 1) {
+            Write-Host 'The server is up but exposes no tools - the bridge would connect and register nothing.'
+            exit 1
+        }
+
+        # And it is not necessarily YOUR server. This path never compared the -Program you asked
+        # for against what is loaded, so the exit code was identical whether the running server
+        # held the game EXE you named, a loose -File DLL from an earlier session, or nothing at
+        # all. Only the program can be checked: /get_metadata reports the PROGRAM, and headless
+        # answers /list_project_files with "requires GUI mode", so a -Project mismatch is
+        # invisible from here and is not claimed either way.
+        $mismatch = ''
+        $asked = ''
+        if ($File) { $asked = $File }
+        elseif ($Program) { $asked = $Program }
+        if ($asked) {
+            $meta = Invoke-Endpoint '/get_metadata' 120
+            if (-not $meta.Ok -or $meta.Body -match 'No program loaded') {
+                Write-Host "  It holds NO program, and you asked for '$asked'."
+                $mismatch = "the running server holds no program, and you asked for '$asked'"
+            }
+            else {
+                $loadedName = Get-MetadataProgramName $meta.Body
+                $wantName = Get-RequestedProgramLeaf $asked
+                if (-not $loadedName) {
+                    # An answer we could not read is not evidence of the wrong program. Say so
+                    # and leave the exit code alone rather than failing a server that may be
+                    # exactly right -- an invented mismatch costs a -Stop and a full reload.
+                    Write-Host '  (/get_metadata gave no readable program_name, so what is loaded was not compared.)'
+                }
+                elseif ($loadedName -ne $wantName) {
+                    Write-Host "  It holds '$loadedName', and you asked for '$asked'."
+                    $mismatch = "the running server holds '$loadedName', not '$wantName'"
+                }
+                else {
+                    Write-Host "  It holds '$loadedName', which is what you asked for."
+                }
+            }
+        }
+
         Write-Host 'Use -Stop first if you need to change the loaded project or program.'
+        if ($mismatch -or -not $configOk) {
+            Write-Host ''
+            Write-Host 'Exit 2 -- the server is up and exposing its tools, but this is not the state you'
+            Write-Host 'asked for:'
+            if ($mismatch) { Write-Host "  * $mismatch" }
+            if (-not $configOk) { Write-Host "  * the .mcp.json in $WriteMcpConfigTo does not describe this server (see above)" }
+            exit 2
+        }
         exit 0
     }
     # Get-ServerPid hands back a process only when the name and start time still match the
@@ -307,6 +699,19 @@ elseif (-not $Project) {
     $Project = Join-Path $Root 'BethesdaGhidraScripts\ghidraprojects\BethesdaGhidraScripts'
 }
 
+# What the CALLER asked to have loaded, captured before the lock handling below can clear it
+# (and after the -File branch above, whose blanking of $Program is a deliberate precedence rule,
+# not a degradation). The locked-project path blanks $Program on purpose -- starting without a
+# project beats failing deep inside Ghidra -- but blanking it also switched OFF the
+# /get_metadata verification near the end of this file, which is gated on `if ($Program -or
+# $File)`. So the one case that GUARANTEES no program was the one case that stopped checking:
+# the tool count passed (tools register with nothing loaded), a .mcp.json was written pointing
+# at an empty server, and the run exited 0. These three variables are what the tail holds the
+# run to: you asked for a program, you did not get one, that is exit 2.
+$askedProgram = $Program
+$lockHolder = ''
+$degraded = ''
+
 # A Ghidra project is single-writer. If the enrichment pipeline (or a GUI, or another
 # agent) holds it, opening it here fails deep inside Ghidra with a confusing error --
 # and forcing it risks the database. Detect it up front and say who has it.
@@ -321,6 +726,10 @@ if ($Project) {
         $who = Get-GhidraHolderDescription
         if ($who) { Write-Host "         holder: $who" }
         else { Write-Host '         (holder not identified - it may be a pyghidra/python process)' }
+        # Kept for the tail. By the time the run ends this warning has scrolled past a whole
+        # server start, and an exit 2 that says "your -Program was dropped" is only actionable
+        # if it can name the process to go and stop.
+        $lockHolder = $who
         Write-Host '         Starting the server WITHOUT a project. Re-run once it is free.'
         Write-Host '         Never delete the lock while it is held - that is how databases get corrupted.'
         $Project = ''
@@ -402,6 +811,24 @@ try { $procName = $proc.ProcessName; $procStart = $proc.StartTime.ToUniversalTim
     startedUtc = $procStart.ToString('o')
 } | ConvertTo-Json | Set-Content $pidFile -Encoding ascii
 
+# Beside it, and cross-referenced to it: what this server was TOLD to load. -Status has no other
+# way to tell "started with no program on purpose" from "asked for one and does not have it",
+# because /get_metadata answers "No program loaded" to both -- and that ambiguity is why -Status
+# used to exit 0 on a server an agent could not decompile a single function with. Repeating the
+# pid and start time is what makes it self-invalidating: a record left over from an earlier
+# server on this port matches no live process and is ignored (see Get-LoadRecord), so nothing
+# has to remember to delete it. Written on every start, including the ones that load nothing,
+# because "no program was asked for" is the answer -Status most needs to be able to trust.
+# UTF8 rather than the pid record's ascii: a -File path can hold anything the filesystem allows.
+[pscustomobject]@{
+    pid        = $proc.Id
+    startedUtc = $procStart.ToString('o')
+    port       = $Port
+    program    = $Program
+    file       = $File
+    project    = $Project
+} | ConvertTo-Json | Set-Content $loadFile -Encoding UTF8
+
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
 $conn = $null
 while ((Get-Date) -lt $deadline) {
@@ -449,43 +876,55 @@ if ($Program -or $File) {
         Write-Host 'A "LockException: Unable to lock project" above means something still holds it.'
         Write-Host 'For the program path, use the folder layout the pipeline imported into, e.g.'
         Write-Host '  /f4/vr/Fallout4VR.exe.unpacked.exe'
-        exit 1
+        # This used to exit 1 on the spot. The server is up and serving its entire toolset -- it
+        # is just empty -- which is the same state the locked-project case below lands in, so it
+        # gets the same code rather than two different answers for one situation. Falling through
+        # instead of exiting also matters: a -WriteMcpConfigTo was still asked for and the config
+        # it writes is correct (it describes this running server), and the caller needs the
+        # "Stop it with:" line for the JVM this run left behind.
+        $degraded = "'$wanted' did not load, so the server is running with no program"
     }
-    $flat = ($meta.Body -replace '\s+', ' ')
-    Write-Host "Loaded: $($flat.Substring(0,[Math]::Min(240,$flat.Length)))"
+    else {
+        $flat = ($meta.Body -replace '\s+', ' ')
+        Write-Host "Loaded: $($flat.Substring(0,[Math]::Min(240,$flat.Length)))"
+    }
+}
+elseif ($askedProgram) {
+    # Reached only when the lock handling above cleared the -Program you asked for, which is why
+    # $askedProgram exists at all: with $Program blanked, the verification above does not run,
+    # and every check that DOES run passes. The server is healthy, the tool count is full, and
+    # not one MCP call will return anything but "No program loaded".
+    Write-Host ''
+    Write-Host "You asked for -Program '$askedProgram' and the server was started WITHOUT it,"
+    Write-Host 'because the project is locked by another process.'
+    if ($lockHolder) { Write-Host "  holder: $lockHolder" }
+    else { Write-Host '  (holder not identified - it may be a pyghidra/python process)' }
+    Write-Host '  Never delete the lock while it is held - that is how databases get corrupted.'
+    $degraded = "-Program '$askedProgram' was dropped because the project is locked"
 }
 
 # --------------------------------------------------------------------------- .mcp.json
+$configOk = $true
 if ($WriteMcpConfigTo) {
-    if (-not (Test-Path $WriteMcpConfigTo)) { throw "-WriteMcpConfigTo '$WriteMcpConfigTo' does not exist." }
-    $target = Join-Path $WriteMcpConfigTo '.mcp.json'
-    $cfg = [ordered]@{
-        mcpServers = [ordered]@{
-            ghidra = [ordered]@{
-                type    = 'stdio'
-                command = $manifest.bridgeExe
-                args    = @()
-                env     = [ordered]@{
-                    PYTHONIOENCODING = 'utf-8'
-                    # Required: headless serves no /mcp/instance_info, so the bridge's
-                    # discovery scan finds nothing. This pins the TCP fallback instead.
-                    GHIDRA_MCP_URL   = $baseUrl
-                }
-            }
-        }
-    }
-    if (Test-Path $target) {
-        Write-Host "NOTE: $target already exists - leaving it alone. Merge this in yourself:"
-        $cfg | ConvertTo-Json -Depth 6
-    }
-    else {
-        $cfg | ConvertTo-Json -Depth 6 | Set-Content $target -Encoding UTF8
-        Write-Host "Wrote $target - restart your agent session there to pick up the ghidra tools."
-    }
+    $configOk = Write-McpConfigFile -Directory $WriteMcpConfigTo -BridgeExe "$($manifest.bridgeExe)"
 }
 
 Write-Host ''
 Write-Host "Stop it with: .\setup\36-ghidra-mcp.ps1 -Stop"
+
+# ONE place decides the exit code, because "whichever branch fell through last" is how a run
+# that dropped your -Program, or left a .mcp.json pointing at another server, still reported
+# success. Exit 0 from here asserts the state the caller ASKED for holds; anything else that is
+# still up and serving tools is a 2 (see EXIT CODES at the top of this file).
+if ($degraded -or -not $configOk) {
+    Write-Host ''
+    Write-Host 'Exit 2 -- the server is up and exposing its tools, but this is not the state you'
+    Write-Host 'asked for:'
+    if ($degraded) { Write-Host "  * $degraded" }
+    if (-not $configOk) { Write-Host "  * the .mcp.json in $WriteMcpConfigTo does not describe this server (see above)" }
+    Write-Host 'Nothing else failed, so the JVM is running and still has to be stopped.'
+    exit 2
+}
 
 # $LASTEXITCODE is set by native commands, not by a .ps1 falling off the end -- without
 # this an explicit success is indistinguishable from a stale exit code left by whatever

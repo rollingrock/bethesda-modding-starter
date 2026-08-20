@@ -232,9 +232,25 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    machine the first GUI launch has no MCP server; launch Ghidra once, re-run
    `30-ghidra.ps1`, and it will auto-start from then on.
 
-**Gate:** `36-ghidra-mcp.ps1 -Status` reports a live connection, a non-zero tool count, and a
-loaded program; then an MCP session can `decompile_function` and see **real names** rather
-than `FUN_*`. **Read `docs/GHIDRA_WORKFLOW.md` before real RE work.**
+**Gate:** `36-ghidra-mcp.ps1 -Status` **exits 0** — which now means all three of a live
+connection, a non-zero tool count, and a loaded program, rather than just the connection. Then
+an MCP session can `decompile_function` and see **real names** rather than `FUN_*`.
+**Read `docs/GHIDRA_WORKFLOW.md` before real RE work.**
+
+**Exit 2 from `-Start` means "up, but not what you asked for" — read it, don't retry it.** The
+server is running and serving its full toolset; something about the *requested* state does not
+hold. Three ways to get it, and each wants a different response:
+
+- **The project was locked**, so your `-Program` was dropped and the server came up empty. The
+  holder is named in the output. Wait for it, or work against the loaded-nothing server. Never
+  delete a lock that is held.
+- **A different program is loaded** than the one you named. `-Stop` first, then `-Start` again.
+- **The `.mcp.json` already there points somewhere else** — a different port or a different
+  bridge. The difference is printed; reconcile it, or point `-WriteMcpConfigTo` elsewhere.
+
+A caller that gates on `-eq 0` treats 1 and 2 alike and is right to. Only ask which it was when
+you need "it is up, just not loaded" to be actionable. Either way the JVM is running and still
+has to be stopped.
 
 **`-Stop` exiting 1 is a refusal, not a flake — do not retry-loop it.** It declines in exactly
 two cases, and both mean stopping would destroy something: `/save_all_programs` failed, so
