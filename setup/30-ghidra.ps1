@@ -80,8 +80,35 @@ if (-not $ghidraHome) {
     }
 }
 if (-not $ghidraHome) {
+    # Rank on a PARSED version, never on the directory name. A string sort puts '9' after
+    # '1', so ghidra_9.2.4_PUBLIC beats ghidra_11.3.2_PUBLIC (and ghidra_11.9 beats
+    # ghidra_11.10) -- "newest wins" would quietly build the extension for a years-old
+    # install. The version gate below is physically incapable of catching that: it only
+    # proves the zip was stamped for the install we PICKED, so it prints "9.2.4 == 9.2.4 OK"
+    # while the user's real 11.3.2 never receives the extension and every line of output
+    # claims success. Rank on application.version rather than on the folder name because it
+    # is the authoritative version -- it is what the rest of this script builds and gates
+    # against, and users do rename these directories.
     $ghidraHome = Get-ChildItem $ToolsDir -Directory -Filter 'ghidra_*' -ErrorAction SilentlyContinue |
-        Where-Object { Get-GhidraProps $_.FullName } | Sort-Object Name -Descending | Select-Object -First 1
+        ForEach-Object {
+            # The same filter this used to do in a Where-Object, but reading the properties
+            # once: a directory with no Ghidra\application.properties is not a Ghidra
+            # install and never becomes a candidate.
+            $p = Get-GhidraProps $_.FullName
+            if ($p) {
+                # Never throw on a version we did not expect -- a dev build stamps
+                # "11.4-DEV" and [version] needs at least two components, so '11' alone
+                # would throw. Anything unparseable floors to 0.0 and sorts last instead of
+                # taking the whole script down.
+                $v = [version]'0.0'
+                if ("$($p['application.version'])" -match '^\d+(\.\d+)*') {
+                    $n = $Matches[0]
+                    if ($n -notmatch '\.') { $n = "$n.0" }
+                    try { $v = [version]$n } catch {}
+                }
+                [pscustomobject]@{ Dir = $_; Version = $v }
+            }
+        } | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty Dir
 }
 if (-not $ghidraHome) {
     throw @"
