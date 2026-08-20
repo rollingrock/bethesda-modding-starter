@@ -89,6 +89,11 @@ jobs:
           if (-not $vcpkg -or -not (Test-Path $vcpkg)) { $vcpkg = Join-Path $env:RUNNER_TEMP 'vcpkg' }
           Write-Host "Using vcpkg at $vcpkg"
           .\setup\10-vcpkg.ps1 -VcpkgDir $vcpkg -NoEnv
+          # 10-vcpkg.ps1 now exits explicitly on every path, so read that exit code here.
+          # Nothing else in this step does: the trailing `exit 0` below would swallow a
+          # non-zero one and the job would instead fail later, in configure, with a vcpkg
+          # error that says nothing about the bootstrap having failed.
+          if ($LASTEXITCODE -ne 0) { throw "10-vcpkg.ps1 failed (exit $LASTEXITCODE)" }
           # The manifest pins a builtin-baseline, so that commit must exist in this clone.
           $baseline = (Get-Content templates/f4sevr-plugin/vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
           Write-Host "manifest builtin-baseline: $baseline"
@@ -105,8 +110,13 @@ jobs:
           # VCPKG_INSTALLATION_ROOT -- the trap 10-vcpkg.ps1 documents.
           "VCPKG_ROOT=$vcpkg"              | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "VCPKG_INSTALLATION_ROOT=$vcpkg" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          # Real failures in 10-vcpkg.ps1 throw (fatal under the shell's EAP=stop); this only
-          # stops a leftover native exit code from being read as the step result.
+          # A real failure in 10-vcpkg.ps1 is caught by the gate on $LASTEXITCODE above (and
+          # anything it throws is fatal under this shell's EAP=stop), so this exit is not
+          # what guards the setup script. What it absorbs is the `git cat-file -e` probe
+          # above, which is EXPECTED to fail when the clone predates the manifest baseline --
+          # that miss is captured into $haveBaseline as a warning, not an error. GitHub's
+          # powershell shell appends `exit $LASTEXITCODE`, so without this the deliberately
+          # tolerated probe would fail the step red.
           exit 0
 
       - name: Scaffold an F4VR plugin
