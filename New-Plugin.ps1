@@ -36,8 +36,27 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# The setup scripts dot-source this as "$PSScriptRoot\_common.ps1"; from the pack root it is one
+# directory down. It is pulled in for New-McpConfigObject -- the single definition of what goes
+# in a .mcp.json -- and dot-sourcing has to happen at the top level, because the pin the
+# generator reads lives in _common.ps1's script scope. Nothing in that file touches the machine
+# at load time (see its header), so this is safe to do before the -Mo2Path checks below.
+. "$PSScriptRoot\setup\_common.ps1"
+
 $packRoot = $PSScriptRoot
 $target = Join-Path $Dir $Name
+# Pinned to an absolute path HERE, once, before anything Push-Locations into it. Everything
+# else in this script resolves a relative $target through the PowerShell provider (Copy-Item,
+# Get-ChildItem, git clone), but Write-ScaffoldMcpConfig writes through [IO.File], which is
+# .NET and resolves against the PROCESS working directory -- a thing Push-Location and even
+# Set-Location never change. In an interactive session that has cd'd anywhere, the two differ,
+# so a relative -Dir would put the repo in one place and its .mcp.json in another (or throw
+# mid-scaffold if that other place has no such folder), and `git add -A` would then commit the
+# scaffold with no .mcp.json at all and still print Done. Resolving it once keeps every
+# consumer below on the same directory. Get-Location is the right base precisely because it is
+# what the provider-based calls would have used; when -Dir is already absolute (its default,
+# and every documented invocation) this is a no-op.
+if (-not [IO.Path]::IsPathRooted($target)) { $target = Join-Path (Get-Location).ProviderPath $target }
 
 # git writes progress AND benign warnings ("LF will be replaced by CRLF") to stderr. Under
 # Windows PowerShell 5.1 a native command's stderr becomes an ErrorRecord whenever the caller
@@ -72,6 +91,65 @@ function Get-CommitIdentityArgs {
     Write-Host 'git has no user.name/user.email set; using a scaffold identity for the initial commit.'
     Write-Host '  set yours with: git config --global user.email "you@example.com"'
     return @('-c', 'user.name=bethesda-modding-starter', '-c', 'user.email=scaffold@localhost')
+}
+
+# .mcp.json is the only file this scaffolder writes that points at something OUTSIDE the new
+# repo, and it used to be a verbatim Copy-Item of mcp\mcp.template.json -- whose ghidra command
+# is the literal C:/repos/ghidra-mcp/.venv/Scripts/bridge-mcp-ghidra.exe. Every setup script in
+# this pack is parameterised (-Root, -GhidraMcpDir), so on a machine set up under D:\dev that
+# path does not exist: the scaffold committed a ghidra server that can never spawn and then
+# printed nothing but "Done", and the first symptom was an agent session in the new repo with no
+# Ghidra tools in it -- while 90-verify, which honours -Root, kept reporting the bridge as PASS
+# (ids 39, 77). New-McpConfigObject in setup\_common.ps1 is now the one definition of this file's
+# contents: it reads the bridge path 30-ghidra.ps1 recorded in setup\.ghidra-mcp-build.json,
+# which is the only thing on the machine that knows a non-default -GhidraMcpDir, and it warns
+# when it had to fall back to the conventional path. Both scaffold branches call THIS function
+# rather than repeating the write, because they are the same three lines twice and the Starfield
+# one is the branch that gets forgotten.
+function Write-ScaffoldMcpConfig {
+    param([Parameter(Mandatory)][string]$RepoRoot)
+
+    # -WarningVariable rather than a second look at the manifest: the generator has already
+    # decided whether the path is known or guessed, and re-deriving that here would be a second
+    # opinion free to drift from the first. This does not silence anything -- the generator's
+    # warning still prints -- it only lets the scaffold add the two things the generator cannot
+    # know: which directory to re-run the resolver against, and that this file is about to be
+    # committed in that state.
+    $mcpWarnings = @()
+    $cfg = New-McpConfigObject -WarningVariable mcpWarnings
+
+    # Absolute path on purpose. The callers below run inside Push-Location $target, but [IO.File]
+    # is .NET and resolves a relative path against the PROCESS working directory, which
+    # Push-Location does not change -- a bare '.mcp.json' would be written wherever the shell
+    # happened to be started, leaving the scaffold without one and silently clobbering whatever
+    # sat there.
+    $configPath = Join-Path $RepoRoot '.mcp.json'
+    # Explicit no-BOM UTF-8 via WriteAllText, the pattern 30-ghidra.ps1 uses for the files it
+    # generates, and it earns its keep twice over. Set-Content's default encoding is the ANSI
+    # codepage, which mangles every non-ASCII byte in a path (corruption reproduced in this repo
+    # under cp932), and that path is a Windows install location that may well contain one. A
+    # UTF-8 BOM in front of the opening brace is the other half: JSON parsers are entitled to
+    # reject it, and an MCP client that does simply reports no servers.
+    [IO.File]::WriteAllText($configPath, (($cfg | ConvertTo-Json -Depth 6) + "`r`n"), [Text.UTF8Encoding]::new($false))
+
+    if ($mcpWarnings.Count -gt 0) {
+        # Said out loud, and NOT folded into the exit code: the repo the caller asked for exists,
+        # is committed and builds, so exit 0 is still the truth about the scaffold. What is
+        # unresolved is a path to a tool on THIS machine, which 30-ghidra.ps1 can supply
+        # afterwards without the scaffold being redone. The failure being closed here was silence,
+        # not a wrong status -- so the repair is printed with the real directory already in it.
+        Write-Host ''
+        Write-Host "NOTE: $configPath carries a GUESSED ghidra bridge path (see the warning above),"
+        Write-Host 'and the scaffold commit below includes it in that state. New-Plugin.ps1 cannot resolve'
+        Write-Host 'it alone -- it has no -Root/-GhidraMcpDir, and setup\.ghidra-mcp-build.json, the only'
+        Write-Host 'record of where the bridge really is, is written by 30-ghidra.ps1. Repair it with:'
+        Write-Host "  $(Join-Path $packRoot 'setup\30-ghidra.ps1')                    (if it has never run here)"
+        Write-Host "  $(Join-Path $packRoot 'setup\36-ghidra-mcp.ps1') -WriteMcpConfigTo `"$RepoRoot`""
+        Write-Host 'The x64dbg entry is correct either way -- it is a pinned npx package, not a path.'
+    }
+    else {
+        Write-Host "Wrote $configPath (ghidra bridge path taken from setup\.ghidra-mcp-build.json)."
+    }
 }
 
 if (Test-Path $target) { throw "Target already exists: $target" }
@@ -176,7 +254,9 @@ instance-mode MO2 keeps it under %LOCALAPPDATA%\ModOrganizer\<game>\mods).
         }
 
         # Per-project MCP config so Claude Code sessions in the new repo get Ghidra + x64dbg.
-        Copy-Item (Join-Path $packRoot 'mcp\mcp.template.json') '.mcp.json'
+        # Generated, never copied from mcp\mcp.template.json -- that template's ghidra command is
+        # hard-coded to the default install root (see Write-ScaffoldMcpConfig above).
+        Write-ScaffoldMcpConfig -RepoRoot $target
 
         Invoke-Git add -A
         $ident = Get-CommitIdentityArgs
@@ -218,7 +298,10 @@ elseif ($Game -eq 'SF') {
     Push-Location $target
     try {
         Invoke-Git init --initial-branch=main | Out-Null
-        Copy-Item (Join-Path $packRoot 'mcp\mcp.template.json') '.mcp.json'
+        # Same generated config as the F4VR branch above, for the same reason -- the Starfield
+        # scaffold committed the identical dead ghidra path, one branch further down where nobody
+        # was looking.
+        Write-ScaffoldMcpConfig -RepoRoot $target
         Invoke-Git add -A
         $ident = Get-CommitIdentityArgs
         Invoke-Git @ident commit -m "chore: scaffold $Name from sfse-template" | Out-Null

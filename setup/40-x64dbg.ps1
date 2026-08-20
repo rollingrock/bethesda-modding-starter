@@ -5,17 +5,38 @@
 .DESCRIPTION
     Downloads the latest x64dbg snapshot and the PINNED MCP plugin release, and installs
     the plugin into both the x64 and x32 plugin folders. The npm-side MCP server is run
-    via npx pinned to the SAME version in .mcp.json (see mcp/mcp.template.json) — plugin
-    and server versions must match, and an unpinned npx would drift.
+    via npx pinned to the SAME version in .mcp.json -- plugin and server versions must
+    match, and an unpinned npx would drift. Both halves of that pin come from one constant,
+    $script:X64dbgMcpServerPin in setup\_common.ps1: this script derives the release TAG
+    from it, New-McpConfigObject writes the npm spec from it.
 #>
 [CmdletBinding()]
 param(
     [string]$InstallDir = 'C:\tools\x64dbg',
-    # Keep in sync with the x64dbg-mcp-server@<ver> pin in mcp/mcp.template.json.
-    [string]$McpVersion = 'v2.3.0'
+    # Empty ON PURPOSE -- the real default is resolved a few lines down, after the dot-source.
+    # See the comment there before "tidying" the pin back up here.
+    [string]$McpVersion = ''
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot\_common.ps1"
+
+# The pin lives in _common.ps1 as $script:X64dbgMcpServerPin, and it has to be resolved HERE
+# rather than as the parameter default above. PowerShell binds parameters -- and evaluates
+# their defaults -- BEFORE the first statement of the body runs, so
+# `param([string]$McpVersion = $script:X64dbgMcpReleaseTag)` binds an empty string: the
+# dot-source that defines the constant has not executed yet. And it does not fail where the
+# mistake is: an empty $McpVersion leaves the release URL below ending at .../releases/tags/ ,
+# GitHub answers 404, and Invoke-RestMethod throws about a release that is not there -- which
+# reads as "upstream deleted the pinned tag" and sends the next person to check GitHub rather
+# than the param block. Default it to '' and fill it in after the dot-source; that is the only
+# ordering in which the constant is readable.
+#
+# The TAG form, with the leading v, because that is what bromoket/x64dbg_mcp names its GitHub
+# releases; .mcp.json's npm spec takes the bare form. Both are derived from the one constant so
+# they cannot drift -- which is what the "keep in sync with mcp/mcp.template.json" comment that
+# used to sit in the param block was asking a human to do by hand.
+if (-not $McpVersion) { $McpVersion = $script:X64dbgMcpReleaseTag }
 
 # 1. x64dbg snapshot
 if (-not (Test-Path (Join-Path $InstallDir 'x96dbg.exe'))) {

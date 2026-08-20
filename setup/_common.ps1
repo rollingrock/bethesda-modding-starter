@@ -874,3 +874,179 @@ function Write-ProbeResult {
         }
     }
 }
+
+# ------------------------------------------------------------------ .mcp.json generator
+# ONE answer to "what goes in .mcp.json", because there used to be two and they disagreed in
+# both directions at once.
+#
+# mcp/mcp.template.json carried BOTH servers but hard-coded
+# C:/repos/ghidra-mcp/.venv/Scripts/bridge-mcp-ghidra.exe, and New-Plugin.ps1 Copy-Item'd it
+# verbatim into every scaffold and then committed it -- so a machine whose repos are not under
+# C:\repos got a .mcp.json whose ghidra server can never spawn, with nothing on the machine
+# saying so until an agent session came up with no Ghidra tools (ids 39, 77).
+# 36-ghidra-mcp.ps1 built its own object inline with the paths correctly resolved from the
+# build manifest and NO x64dbg entry at all -- so the config the template's own _comment
+# promises "36 generates this for you" silently dropped the server 40-x64dbg.ps1 spends an
+# entire phase installing (id 75). Each file was the fix for the other one's bug, and neither
+# knew it. With one generator the two failures cannot both be true of the same object.
+#
+# This is NOT part of the probe layer above and is deliberately placed after it: a probe
+# answers a question and stays silent, this one produces configuration and WARNS when it had
+# to guess. Keeping them apart is what lets the probes keep their never-write rule.
+#
+# The two assignments below are the only statements in this file that run at dot-source time.
+# The header's "nothing here has side effects at load time" still holds -- they define values,
+# they do not touch the machine.
+
+# ONE pin for the x64dbg MCP pair, stored in the bare npm form.
+#
+# MIND THE TWO FORMS, because they are not interchangeable and nothing but this comment says
+# so: bromoket/x64dbg_mcp tags its GitHub releases with a leading v ('v2.3.0', which is what
+# 40-x64dbg.ps1 fetches /releases/tags/<tag> with), while the npm spec in .mcp.json has no v
+# ('x64dbg-mcp-server@2.3.0'). Store the bare version, derive the tag, and the pair cannot
+# drift. Until this existed, 40-x64dbg.ps1 carried a comment asking a HUMAN to keep its default
+# in step with a string buried in a JSON file -- and 40-x64dbg.ps1's own description states the
+# stake plainly: plugin and server versions must match. A drifted pair installs a .dp64 from
+# one release and npx-fetches a server from another, which fails at the handshake inside an MCP
+# session rather than during setup, where somebody is watching.
+$script:X64dbgMcpServerPin = '2.3.0'
+$script:X64dbgMcpReleaseTag = 'v' + $script:X64dbgMcpServerPin
+
+<#
+.SYNOPSIS
+    Build the .mcp.json object -- BOTH servers, bridge path resolved -- that every consumer writes.
+
+.DESCRIPTION
+    Returns one [ordered] hashtable and leaves the serialising to the caller
+    (ConvertTo-Json -Depth 6), because the two consumers do different things with it:
+    New-Plugin.ps1 drops it into a fresh scaffold, 36-ghidra-mcp.ps1 holds it up against a
+    .mcp.json that may already exist. Handing back an object rather than text is what lets the
+    second one DIFF instead of overwrite.
+
+    The ghidra command is resolved in this order, and the order is the point:
+      1. an explicit -BridgeExe, for a caller that already knows the path (36-ghidra-mcp.ps1 has
+         the build manifest open in front of it);
+      2. bridgeExe from setup\.ghidra-mcp-build.json, which 30-ghidra.ps1 writes and which is the
+         only thing on the machine that knows a non-default -GhidraMcpDir;
+      3. the conventional C:\repos\ghidra-mcp path -- a GUESS about this machine, which is why
+         reaching it WARNS.
+
+    -ManifestPath overrides where step 2 looks; empty means .ghidra-mcp-build.json beside this
+    file. -Port (default 8089) feeds GHIDRA_MCP_URL and nothing else, and it must be the port
+    the headless server was actually started on: 36-ghidra-mcp.ps1 takes -Port for a machine
+    where 8089 is busy, and a config pinned to the other number describes a server that is not
+    there.
+
+    That warning on step 3 makes this the one function in this file that writes to the host. It
+    is a generator, not a probe, and the probe layer above it is forbidden from printing (see
+    its header) precisely so callers can compose probes; nothing composes this. A silent guess
+    is the exact failure being closed here -- the hard-coded template path was wrong on any
+    machine that did not use the defaults, and said nothing.
+
+    It does NOT check that the resolved exe exists, let alone that it runs. Existence is not
+    capability in this pack and that question already has an owner: Test-VenvExeRuns EXECUTES
+    the launcher, which is the only way to tell a live venv from one orphaned by a Python
+    upgrade (id 12). A Test-Path here would read like verification and be neither.
+
+    The x64dbg entry is always present, pinned from $script:X64dbgMcpServerPin above.
+
+.EXAMPLE
+    New-McpConfigObject -Port 8090 | ConvertTo-Json -Depth 6
+#>
+function New-McpConfigObject {
+    [CmdletBinding()]
+    param(
+        [int]$Port = 8089,
+        [string]$BridgeExe = '',
+        [string]$ManifestPath = ''
+    )
+
+    # $PSScriptRoot inside a function defined here is _common.ps1's OWN directory (setup\), no
+    # matter who dot-sourced it -- the same property Test-VcpkgUsable relies on -- and setup\ is
+    # where 30-ghidra.ps1 writes the manifest. So New-Plugin.ps1, running from the pack root or
+    # from a scaffold directory, finds it without being told where it is.
+    if (-not $ManifestPath) { $ManifestPath = Join-Path $PSScriptRoot '.ghidra-mcp-build.json' }
+
+    # 30-ghidra.ps1's -GhidraMcpDir default with the layout pip -e leaves under it. It is the
+    # only guess available, and it is the guess that shipped hard-coded in the template.
+    $conventional = 'C:\repos\ghidra-mcp\.venv\Scripts\bridge-mcp-ghidra.exe'
+
+    $command = "$BridgeExe".Trim()
+    if (-not $command) {
+        # Every branch here records WHY the manifest could not answer, because the three causes
+        # want the same repair but read completely differently to a human: never built, built by
+        # a version that did not record the field, or a file that will not parse.
+        $why = ''
+        $found = $false
+        try { $found = Test-Path $ManifestPath -ErrorAction Stop }
+        catch { $found = $false }
+        if (-not $found) {
+            $why = "there is no build manifest at $ManifestPath, so nothing here has ever built the bridge"
+        }
+        else {
+            try {
+                $rec = Get-Content $ManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json
+                # Ask the property bag rather than the property: an older manifest is missing
+                # fields as a matter of course (30-ghidra.ps1 has grown them), and reading
+                # $rec.bridgeExe straight would turn "field absent" into a $null that reads
+                # exactly like "path is empty".
+                $prop = $null
+                if ($rec) { $prop = $rec.PSObject.Properties['bridgeExe'] }
+                if ($prop) { $command = "$($prop.Value)".Trim() }
+                if (-not $command) {
+                    $why = "$ManifestPath carries no bridgeExe -- it was written by an older setup\30-ghidra.ps1 that did not record one"
+                }
+            }
+            catch {
+                $why = "$ManifestPath could not be read: $($_.Exception.Message)"
+            }
+        }
+        if (-not $command) {
+            $command = $conventional
+            Write-Warning ("The ghidra bridge path in this .mcp.json is a GUESS: $why. " +
+                "Using $conventional. That is only where setup\30-ghidra.ps1 puts it BY DEFAULT: " +
+                'on a machine whose repos live anywhere else, the ghidra server in this config can ' +
+                'never spawn, and the first symptom is an agent session with no Ghidra tools in it. ' +
+                'Run setup\30-ghidra.ps1 -- it records the real path -- and generate this again.')
+        }
+    }
+
+    $pin = "$script:X64dbgMcpServerPin".Trim()
+    if (-not $pin) {
+        # Not reachable from any argument: it means the constant above is gone, or that a caller
+        # dot-sourced _common.ps1 somewhere its script scope cannot see. Refuse rather than emit
+        # 'x64dbg-mcp-server@', which npx resolves to whatever is newest -- an unpinned server
+        # against a pinned plugin is the drift this constant exists to make impossible.
+        throw 'X64dbgMcpServerPin is empty -- setup\_common.ps1 defines it, so dot-source it at your script''s top level. Refusing to write an unpinned x64dbg-mcp-server@ into .mcp.json.'
+    }
+
+    [ordered]@{
+        mcpServers = [ordered]@{
+            ghidra = [ordered]@{
+                type    = 'stdio'
+                command = $command
+                args    = @()
+                env     = [ordered]@{
+                    PYTHONIOENCODING = 'utf-8'
+                    # REQUIRED for the headless server, not a convenience. The bridge discovers
+                    # instances by probing /mcp/instance_info across 8089..8104, and that endpoint
+                    # is registered only by the Ghidra GUI plugin -- headless never serves it, so
+                    # list_instances() returns [] and NO tools register at all. This pins the
+                    # bridge's TCP fallback instead, which fetches /mcp/schema directly and
+                    # auto-connects. Drop it only if you are driving the GUI.
+                    GHIDRA_MCP_URL   = "http://127.0.0.1:$Port"
+                }
+            }
+            x64dbg = [ordered]@{
+                type    = 'stdio'
+                command = 'cmd'
+                # 'cmd /c npx' rather than 'npx': on Windows npx is npx.cmd, a batch script, and
+                # an MCP client spawns its servers directly with no shell -- which cannot execute
+                # one. The '-y' matters as much: without it npx stops to ask before fetching the
+                # package, and the only console a stdio server has is the client's pipe, so that
+                # prompt is never seen, never answered, and the server never starts.
+                args    = @('/c', 'npx', '-y', "x64dbg-mcp-server@$pin")
+            }
+        }
+    }
+}
