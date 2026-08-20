@@ -388,7 +388,7 @@ function Test-JavaForGradle {
         $candidate = Join-Path $javaHome 'bin\java.exe'
         $shown = '"' + $candidate + '" -version'
         $found = $false
-        try { $found = Test-Path $candidate }
+        try { $found = Test-Path $candidate -ErrorAction Stop }
         catch {
             return New-ProbeResult $name 'FAIL' "JAVA_HOME is '$javaHome' and cannot be probed: $($_.Exception.Message)" $shown
         }
@@ -482,7 +482,7 @@ function Test-VcpkgUsable {
     $shownVersion = '"' + $exe + '" version'
 
     $found = $false
-    try { $found = Test-Path $exe }
+    try { $found = Test-Path $exe -ErrorAction Stop }
     catch {
         return New-ProbeResult $name 'FAIL' "cannot probe '$exe': $($_.Exception.Message)" $shownVersion
     }
@@ -617,7 +617,7 @@ function Test-RepoIdentity {
     }
 
     $hasGit = $false
-    try { $hasGit = Test-Path (Join-Path $Path '.git') }
+    try { $hasGit = Test-Path (Join-Path $Path '.git') -ErrorAction Stop }
     catch {
         return New-ProbeResult $name 'FAIL' "cannot probe '$Path': $($_.Exception.Message)" $shown
     }
@@ -679,7 +679,7 @@ function Test-VenvExeRuns {
     $shown = '"' + $Path + '" --help'
 
     $found = $false
-    try { $found = Test-Path $Path }
+    try { $found = Test-Path $Path -ErrorAction Stop }
     catch {
         return New-ProbeResult $name 'FAIL' "cannot probe '$Path': $($_.Exception.Message)" $shown
     }
@@ -736,7 +736,7 @@ function Test-GhidraInstallComplete {
     $shownProps = 'Get-Content "' + $props + '"'
 
     $found = $false
-    try { $found = Test-Path $props }
+    try { $found = Test-Path $props -ErrorAction Stop }
     catch {
         return New-ProbeResult $name 'FAIL' "cannot probe '$Path': $($_.Exception.Message)" $shownProps
     }
@@ -810,7 +810,7 @@ function Test-VsWorkload {
     $shown = '"' + $vswhere + '" ' + ($probeArgs -join ' ')
 
     $found = $false
-    try { $found = Test-Path $vswhere }
+    try { $found = Test-Path $vswhere -ErrorAction Stop }
     catch { $found = $false }
     if (-not $found) {
         return New-ProbeResult $name 'FAIL' "no vswhere.exe at $vswhere -- the Visual Studio Installer is not on this machine, so no VS is either" $shown
