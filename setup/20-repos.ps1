@@ -71,6 +71,15 @@ foreach ($r in $repos) {
         continue
     }
     Write-Host "cloning $($r.Url) -> $dest"
+    # Provenance for the failure cleanup below -- never destroy what this script cannot prove
+    # it created. Only a $dest that did NOT exist a moment ago can be a partial clone of ours.
+    # git refuses to clone into an existing non-empty directory ("destination path ... already
+    # exists and is not an empty directory") WITHOUT touching a byte of its contents, so on
+    # that failure everything under $dest is the user's: a GitHub "Download ZIP" extract, a
+    # snapshot with .git deliberately removed (either sails past the .git check at line 69),
+    # or an unrelated working folder that merely shares a repo name. Deleting it cost the user
+    # months of local modifications and reported nothing but a transient clone failure.
+    $existedBefore = Test-Path $dest
     # git reports progress on stderr. Under Windows PowerShell 5.1 that becomes an ErrorRecord
     # whenever the caller merges streams (2>&1), and $ErrorActionPreference='Stop' would then
     # abort before the exit-code check below could clean up the partial clone.
@@ -79,11 +88,32 @@ foreach ($r in $repos) {
     git clone @($r.Args) $r.Url $dest
     $ErrorActionPreference = $prevEap
     if ($LASTEXITCODE -ne 0) {
-        # Remove the partial clone: a half-cloned repo would pass the exists-check on
-        # re-run and hide the failure. Keep going — one bad repo must not block the rest.
-        if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
         $failed += $r.Url
-        Write-Warning "clone failed (cleaned up partial dir): $($r.Url)"
+        if ($existedBefore) {
+            # A separate event from a partial clone, so it gets a separate message: git
+            # declined to write into a directory that was already on disk. One message for
+            # both cases actively misleads -- it told the user their data was "partial" and
+            # that removing it was cleanup. Either way the directory is the user's and this
+            # branch never deletes; only the wording differs.
+            if (Test-Path (Join-Path $dest '.git')) {
+                # git ACCEPTS an existing EMPTY directory, so a dir the user pre-created can
+                # still get a clone started in it that dies later -- a --recurse-submodules
+                # fetch failure (commonlibsf, devbench, vr_address_tools) leaves a complete
+                # .git and a checked-out top level behind. We must not delete it, but it must
+                # not pass silently either: the .git test at line 69 would print "exists" on
+                # the next run and count this broken tree as a finished clone.
+                Write-Warning "clone failed: $($r.Url) -- an INCOMPLETE clone was left inside the pre-existing directory $dest. Not deleting it (this script did not create that directory). Remove or move it aside yourself before re-running, or the next run will see its .git and skip it as already cloned."
+            }
+            else {
+                Write-Warning "clone failed: $($r.Url) -- pre-existing non-repo directory left untouched at $dest; move it aside yourself, then re-run."
+            }
+        }
+        else {
+            # Remove the partial clone: a half-cloned repo would pass the exists-check on
+            # re-run and hide the failure. Keep going — one bad repo must not block the rest.
+            if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+            Write-Warning "clone failed (cleaned up partial dir): $($r.Url)"
+        }
     }
 }
 if ($failed) {
