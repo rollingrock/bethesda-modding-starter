@@ -6,6 +6,7 @@
 setup/.ghidra-mcp-build.json
 setup/.ghidra-headless-cp.txt
 setup/.ghidra-headless.pid
+setup/.ghidra-headless.*.pid
 setup/.ghidra-headless.*.log
 setup/.analysis-verified.json
 

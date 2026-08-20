@@ -51,7 +51,13 @@ param(
     [string]$File = '',
     # Write .mcp.json into this directory so an agent working there gets the tools.
     [string]$WriteMcpConfigTo = '',
-    [int]$TimeoutSec = 180
+    [int]$TimeoutSec = 180,
+    # Go through with a shutdown -Stop would otherwise refuse: one where /save_all_programs
+    # failed (you accept losing whatever the MCP tools changed since the last save, plus a
+    # stale project .lock), or one where something is serving the port but no PID record here
+    # proves we started it (we still only ask it to exit over HTTP -- see the -Stop path).
+    # Deliberately outside the parameter sets, like -Root and -Port, so it applies to any mode.
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -59,7 +65,24 @@ $ErrorActionPreference = 'Stop'
 Sync-Path
 
 $stateDir = $PSScriptRoot
-$pidFile = Join-Path $stateDir '.ghidra-headless.pid'
+# The PID record is scoped to the PORT it describes. One shared file could only ever describe
+# one server, so -Port made it ambiguous in the single direction that matters: with one
+# record, `-Stop -Port 8099` resolved the record of the server actually running on 8089,
+# addressed save and exit to a port nothing was listening on (both fail quietly), and then
+# force-killed that JVM -- a kill with no save, which is the exact trade the -Stop path
+# otherwise refuses to make. Put the port in the name and the question cannot be asked
+# wrongly: each server owns its own record, and a port with no server has none to misread.
+$pidFile = Join-Path $stateDir ".ghidra-headless.$Port.pid"
+# Older versions wrote one unsuffixed file holding a bare integer. It identifies nothing --
+# no process name, no start time, no port -- so nothing may ever act on it. Drop it rather
+# than leave a number lying around for a later run to trust. A server started by that older
+# script keeps running and simply becomes unmanaged: -Stop finds it by probing the port and
+# says so, instead of killing a process it cannot identify.
+$legacyPidFile = Join-Path $stateDir '.ghidra-headless.pid'
+if (Test-Path $legacyPidFile) {
+    Write-Host "Discarding pre-port-scoped PID record $legacyPidFile (a bare number cannot identify a process)."
+    Remove-Item $legacyPidFile -Force -ErrorAction SilentlyContinue
+}
 $outLog = Join-Path $stateDir '.ghidra-headless.out.log'
 $errLog = Join-Path $stateDir '.ghidra-headless.err.log'
 $manifestPath = Join-Path $stateDir '.ghidra-mcp-build.json'
@@ -95,31 +118,130 @@ function Get-ToolCount {
     catch { return -1 }
 }
 
+# The PID file records IDENTITY -- pid, process name and start time -- not just a number,
+# and this function refuses to hand back a process it cannot prove is the java server this
+# checkout started. Nothing cleans the record on boot, so a number left behind by
+# a crash or a reboot outlives the server, and Windows recycles PIDs aggressively: days
+# later that same number can be the user's MO2 or their editor. Both force-kill sites in
+# this file (the -Stop terminate and the -Start "alive but not answering" cleanup) resolve
+# their victim through here, so this one check is what keeps either of them from killing a
+# stranger's process and reporting it as routine cleanup.
+#
+# A record counts only if the PID is live AND the process name still matches AND the start
+# time agrees to within a couple of seconds. Everything else is discarded UNKILLED: a legacy
+# plain-integer pid file (what older versions of this script wrote) carries no identity at
+# all and can never be proven ours, and a StartTime we are not allowed to read belongs to a
+# process owned by somebody else -- by definition not our child. Fail safe, never fail open.
 function Get-ServerPid {
     if (-not (Test-Path $pidFile)) { return $null }
-    $id = (Get-Content $pidFile -Raw).Trim()
-    if (-not $id) { return $null }
-    $p = Get-Process -Id ([int]$id) -ErrorAction SilentlyContinue
-    if ($p) { return $p } else { return $null }
+    $ours = $null
+    try {
+        # ConvertFrom-Json turns a legacy '14332' file into a bare integer with no .pid /
+        # .name / .startedUtc, so it falls out here and is removed rather than trusted.
+        $rec = (Get-Content $pidFile -Raw) | ConvertFrom-Json
+        $recPid = 0
+        if ([int]::TryParse([string]$rec.pid, [ref]$recPid) -and $recPid -gt 0 -and $rec.name -and $rec.startedUtc) {
+            $live = Get-Process -Id $recPid -ErrorAction SilentlyContinue
+            if ($live -and $live.ProcessName -eq [string]$rec.name) {
+                # Start time is the tie-breaker PID reuse cannot fake: the recycled process
+                # necessarily started later than the one we recorded. Reading it throws on a
+                # process we may not inspect, and the catch below turns that into "not ours".
+                $recorded = [datetime]::Parse([string]$rec.startedUtc, [Globalization.CultureInfo]::InvariantCulture)
+                $delta = ($live.StartTime.ToUniversalTime() - $recorded.ToUniversalTime()).TotalSeconds
+                if ([Math]::Abs($delta) -le 2) { $ours = $live }
+            }
+        }
+    }
+    catch { $ours = $null }
+    # Unreadable, legacy, or identifying someone else: drop the record so no later run
+    # inherits the ambiguity and mistakes it for a server it can kill.
+    if (-not $ours) { Remove-Item $pidFile -ErrorAction SilentlyContinue }
+    return $ours
 }
 
 # --------------------------------------------------------------------------- Stop
 if ($Stop) {
     $p = Get-ServerPid
     if (-not $p) {
-        Write-Host 'Headless server is not running (no live PID recorded).'
-        Remove-Item $pidFile -ErrorAction SilentlyContinue
-        exit 0
+        # The PID record is per-checkout state under $PSScriptRoot: 'git clean -fdx' deletes
+        # it, a second clone never had it, and a reboot leaves it identifying nothing. Its
+        # absence is therefore NOT evidence that the server is down -- so ask the port before
+        # claiming that, or we report a successful stop while the JVM keeps serving $baseUrl
+        # and keeps the project lock that 35-ghidra-analysis.ps1 then trips over.
+        $conn = Invoke-Endpoint '/check_connection'
+        if (-not $conn.Ok) {
+            Write-Host "Headless server is not running (no PID of ours recorded, nothing answering on $baseUrl)."
+            exit 0
+        }
+        Write-Host "Something IS serving $baseUrl, but nothing here proves that we started it:"
+        Write-Host "  $($conn.Body.Trim())"
+        if (-not $Force) {
+            Write-Host '  Leaving it alone. It may be a Ghidra GUI, or a headless server started from'
+            Write-Host '  another checkout that still holds its own PID record.'
+            Write-Host '  Stop it from the checkout that started it, or run:'
+            Write-Host '    .\setup\36-ghidra-mcp.ps1 -Stop -Force   # save + /exit_ghidra over HTTP'
+            exit 1
+        }
+        Write-Host '  -Force: asking it to save and exit over HTTP. Nothing is force-killed on this'
+        Write-Host '  path -- with no PID record we cannot prove which process to kill, and a wrong'
+        Write-Host '  Stop-Process would take out whatever inherited that PID.'
     }
-    Write-Host "Stopping headless server (PID $($p.Id)) ..."
+    else {
+        Write-Host "Stopping headless server (PID $($p.Id)) ..."
+    }
     # Save first: a killed JVM leaves the project locked, and a stale .lock blocks every
     # later run (including the enrichment pipeline's). Then shut down over HTTP --
     # CloseMainWindow() is useless here because the JVM runs windowless.
-    $null = Invoke-Endpoint '/save_all_programs' 300
+    $save = Invoke-Endpoint '/save_all_programs' 300
+    if (-not $save.Ok) {
+        # Discarding this result is how hours of work vanish: everything an agent renamed,
+        # retyped or commented through the MCP tools lives in the JVM until this call lands,
+        # and the save is the entire reason the terminate below is survivable. A timeout (busy
+        # decompiler, wedged JVM) or an error means NOTHING was written -- so it must not be
+        # followed by a kill and a printed "Stopped."
+        Write-Host "  /save_all_programs FAILED: $($save.Body)"
+        if (-not $Force) {
+            Write-Host '  UNSAVED DATABASE WORK MAY BE LOST -- leaving the server running.'
+            Write-Host '  Re-run -Stop once the JVM finishes what it is busy with (a long analysis or'
+            Write-Host '  decompile can hold the save past its 300 s timeout). If you accept losing'
+            Write-Host '  every change made since the last successful save, plus a stale project .lock'
+            Write-Host '  the next run has to clear, re-run with -Force.'
+            exit 1
+        }
+        Write-Host '  -Force: shutting down anyway. Changes made since the last successful save are'
+        Write-Host '  being discarded, and the project may be left holding a stale .lock.'
+    }
     $exit = Invoke-Endpoint '/exit_ghidra' 15
-    if (-not $exit.Ok) { Write-Host "  /exit_ghidra did not answer ($($exit.Body)); will terminate." }
+    if (-not $exit.Ok) {
+        if ($p) { Write-Host "  /exit_ghidra did not answer ($($exit.Body)); will terminate." }
+        else { Write-Host "  /exit_ghidra did not answer ($($exit.Body))." }
+    }
+    if (-not $p) {
+        # -Force against a server we cannot claim: HTTP is the only lever we are willing to
+        # pull, so judge the outcome by whether the port went quiet rather than by announcing
+        # a kill we never performed. /exit_ghidra answers BEFORE the JVM is down -- it has to,
+        # or the response could never be sent -- and a real Ghidra closing a loaded project
+        # takes seconds. Poll for the same 20 s the managed path below gives WaitForExit,
+        # rather than calling a shutdown in progress a failure after one impatient probe.
+        $gone = $false
+        $quietBy = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $quietBy) {
+            Start-Sleep -Seconds 1
+            if (-not (Invoke-Endpoint '/check_connection').Ok) { $gone = $true; break }
+        }
+        if (-not $gone) {
+            Write-Host "Still serving $baseUrl. Stop it from the checkout that started it, or end that process yourself."
+            exit 1
+        }
+        Write-Host "Stopped over HTTP ($baseUrl no longer answers)."
+        exit 0
+    }
     if (-not $p.WaitForExit(20000)) {
         Write-Host '  still alive after 20 s; terminating.'
+        # Safe here precisely because Get-ServerPid refused to return anything it could not
+        # prove: this is still the same java process, started at the same instant, that this
+        # checkout launched. Without that proof this line is how a recycled PID gets an
+        # unrelated program killed.
         $p | Stop-Process -Force
     }
     Remove-Item $pidFile -ErrorAction SilentlyContinue
@@ -157,7 +279,17 @@ if ($existing) {
         Write-Host 'Use -Stop first if you need to change the loaded project or program.'
         exit 0
     }
-    Write-Host "PID $($existing.Id) is alive but not answering on $baseUrl; stopping it."
+    # Get-ServerPid hands back a process only when the name and start time still match the
+    # record we wrote at launch, so this is provably OUR java server gone deaf -- not some
+    # unrelated program that inherited a recycled PID. That proof is what makes the force
+    # below acceptable; without it this line kills whatever the number now points at.
+    Write-Host "PID $($existing.Id) is our java server but is not answering on $baseUrl; stopping it."
+    # Say the cost out loud. It is deaf, so there is no /save_all_programs to run first:
+    # whatever the MCP tools changed since its last save dies with it and the project may be
+    # left holding a stale .lock. -Stop refuses that trade without -Force; -Start has to make
+    # it, because a wedged server is exactly what is standing between you and a working one.
+    Write-Host '  It is not answering, so it cannot be asked to save first - changes made through'
+    Write-Host '  the MCP tools since its last save are lost, and it may leave a stale project .lock.'
     $existing | Stop-Process -Force
     Remove-Item $pidFile -ErrorAction SilentlyContinue
 }
@@ -252,7 +384,23 @@ if ($Program) { Write-Host "  program: $Program" }
 Remove-Item $outLog, $errLog -ErrorAction SilentlyContinue
 $proc = Start-Process -FilePath 'java' -ArgumentList $javaArgs -WorkingDirectory $manifest.ghidraHome `
     -PassThru -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog
-$proc.Id | Set-Content $pidFile -Encoding ascii
+# Record WHO we started, not just a number: Get-ServerPid will not let Stop-Process touch a
+# process whose name and start time do not still match these, which is what keeps a recycled
+# PID from being force-killed later. Read both properties defensively -- if java rejected its
+# arguments the process may already have exited, and ProcessName and StartTime both throw on
+# a dead process; the poll loop below reports that case properly with the java exit code and
+# the logs, so a property getter must not abort the script first. The fallbacks stay honest:
+# we launched java, microseconds ago, so both are still true of the process we just spawned.
+$procName = 'java'
+$procStart = (Get-Date).ToUniversalTime()
+try { $procName = $proc.ProcessName; $procStart = $proc.StartTime.ToUniversalTime() } catch { }
+# ASCII by construction (a number, a process name, an ISO-8601 timestamp), and written with
+# an explicit encoding because the repo's encoding lint expects one.
+[pscustomobject]@{
+    pid        = $proc.Id
+    name       = $procName
+    startedUtc = $procStart.ToString('o')
+} | ConvertTo-Json | Set-Content $pidFile -Encoding ascii
 
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
 $conn = $null
