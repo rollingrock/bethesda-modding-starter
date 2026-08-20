@@ -39,11 +39,23 @@ Known trap this phase exists for: `VCPKG_ROOT` **and** `VCPKG_INSTALLATION_ROOT`
 set (different files in the build chain read different names).
 
 What this phase delivers is *both env vars pointing at one healthy vcpkg* — not a vcpkg at
-`C:eposcpkg` specifically. If this machine already has a bootstrapped clone and
+`C:\repos\vcpkg` specifically. If this machine already has a bootstrapped clone and
 `VCPKG_ROOT` names it, `10-vcpkg.ps1` adopts that root in place and says so, rather than
 cloning a second copy and repointing a machine-wide variable other projects resolve through.
 Pass `-VcpkgDir` only when you actually want a particular location; an explicit one always
 wins over adoption.
+
+**Exit codes across the numbered scripts.** `0` = the state you asked for now holds. `2` =
+nothing failed, but work is pending — what `-CheckOnly` reports when there is something to do
+(`35-ghidra-analysis.ps1` is the reference). `1` = a real failure. A script exits `0` only when
+it has *verified* the outcome, never merely because its last line ran, so gate on the exit code
+— and read the message before re-running, because `1` is often a refusal rather than a flake.
+
+**Every gate below is a script, not a file test.** A path existing proves something was
+created, never that it works: `python.exe` on a stock Windows box is a Store stub that exits
+9009, a `.git` directory says nothing about which fork it came from, and a venv launcher
+outlives the interpreter it points at. The `-CheckOnly` paths run the tool the way its real
+consumer does.
 
 ## Phase 2 — repos
 
@@ -51,7 +63,9 @@ wins over adoption.
 .\setup\20-repos.ps1            # add -SkipAddressTools to defer the ~300 MB CSV clone
 ```
 
-**Gate:** `C:\repos\CommonLibF4\.git` exists.
+**Gate:** `.\setup\20-repos.ps1 -CheckOnly` exits 0. A `.git` directory is not the gate: it
+proves something was cloned, not that it came from the URL this pack pins, and a wrong-fork or
+wrong-branch clone would otherwise stay blessed forever.
 
 ## Phase 3 — first plugin build (the real proof)
 
