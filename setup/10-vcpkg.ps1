@@ -18,6 +18,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Test-VcpkgUsable -- the one definition of "this vcpkg works" -- lives here. It matters that
+# it is ONE definition: -CheckOnly, the do-path below and 90-verify each used to answer that
+# question with their own weaker test, and a gate is only ever as strong as its weakest copy.
+. "$PSScriptRoot\_common.ps1"
+
 # What Phase 1 has to deliver is "both env vars point at ONE HEALTHY vcpkg", not "a vcpkg
 # exists at C:\repos\vcpkg". Judging only against $VcpkgDir punished a machine that was
 # already correct: a working clone at, say, D:\dev\vcpkg with VCPKG_ROOT pointing at it got
@@ -64,6 +69,12 @@ if (-not $PSBoundParameters.ContainsKey('VcpkgDir')) {
 # becomes an ErrorRecord whenever the caller merges streams (2>&1), which $ErrorActionPreference
 # ='Stop' would turn into a spurious abort. Run natives with 'Continue' and judge them by their
 # exit code, which is the only trustworthy signal.
+#
+# This deliberately SHADOWS _common.ps1's same-named helper, which takes -Exe/-Arguments: the
+# two calls below wrap a scriptblock instead, because one of them is `git clone <url> <dir>`
+# and the other a .bat with a switch. It works because this definition runs AFTER the
+# dot-source above, so every call in this file binds to this signature. Move the dot-source
+# below this point and the scriptblocks would silently bind to the library's -Arguments.
 function Invoke-Native {
     param([Parameter(Mandatory)][string]$What, [Parameter(Mandatory)][scriptblock]$Body)
     $prev = $ErrorActionPreference
@@ -72,6 +83,7 @@ function Invoke-Native {
     if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
 }
 
+
 $ok = $true
 if (-not (Test-Path (Join-Path $VcpkgDir '.git'))) {
     if ($CheckOnly) { Write-Host "MISSING: vcpkg clone at $VcpkgDir"; $ok = $false }
@@ -79,16 +91,58 @@ if (-not (Test-Path (Join-Path $VcpkgDir '.git'))) {
         Invoke-Native 'git clone vcpkg' { git clone https://github.com/microsoft/vcpkg.git $VcpkgDir }
     }
 }
-elseif (-not $CheckOnly) {
-    # An EXISTING clone goes stale, and a stale vcpkg breaks manifests two different ways:
-    #   1. The pinned `builtin-baseline` commit isn't present at all ->
-    #      "failed to `git show` versions/baseline.json ... exists on disk, but not in <sha>"
-    #   2. The commit IS present but the CHECKED-OUT versions/ database predates the versions
-    #      that baseline names -> "no version database entry for spdlog at 1.17.0"
-    # Both read like a corrupt checkout rather than an old one. Fetching alone only fixes (1),
-    # because vcpkg looks port versions up in the working tree -- so fast-forward as well.
-    # Safe for pinned manifests: a newer tree is a superset of version entries, and each
-    # project still resolves against its own builtin-baseline.
+
+# Bootstrap BEFORE anything asks whether this vcpkg works, because the readiness predicate
+# below answers that by RUNNING vcpkg.exe: on a clone this script just made there would be
+# nothing to run, and the repair would go hunting for staleness in a checkout that is one
+# minute old. The -CheckOnly half of this test is gone on purpose -- `Test-Path vcpkg.exe` is
+# a weaker copy of a question Test-VcpkgUsable answers by executing the tool, and an exe built
+# from an older checkout is present on disk and still fails every configure with
+# "vcpkg-tools.json: document schema version 2 is not supported by this version of vcpkg".
+# Two copies of one contract is how the gate ends up softer than the thing it gates.
+if (-not $CheckOnly -and (Test-Path $VcpkgDir) -and -not (Test-Path (Join-Path $VcpkgDir 'vcpkg.exe'))) {
+    Invoke-Native 'bootstrap-vcpkg' { & (Join-Path $VcpkgDir 'bootstrap-vcpkg.bat') -disableMetrics }
+}
+
+# THE READINESS QUESTION, asked identically by -CheckOnly and by the real run.
+# It used to be arithmetic -- `git rev-list --count 'HEAD..@{u}'` with its stderr sent to
+# $null -- and that arithmetic cannot answer it. On a detached HEAD (what `git checkout
+# <release-tag>` leaves behind, which is how Microsoft's own install instructions once told
+# people to pin vcpkg, and what `git clone --branch <tag>` produces) rev-list exits 128, the
+# count comes back EMPTY, the "behind" test is false, and control fell through to
+# 'vcpkg is up to date.' -> 'vcpkg ready.' -> exit 0 over a clone that cannot resolve the
+# template's manifest at all. Where origin is a FORK, fetch and rev-list both succeed and
+# "up to date" means up to date with the wrong repository. And the whole block sat behind
+# `elseif (-not $CheckOnly)`, so `10-vcpkg.ps1 -CheckOnly` -- what CLAUDE.md calls the Phase 1
+# gate -- was physically incapable of observing the one failure the comment below says this
+# script exists to prevent: "passes the gate" and "can build the template" were decoupled.
+# Test-VcpkgUsable asks what actually decides a build: does vcpkg.exe RUN, and is the
+# builtin-baseline commit that templates\f4sevr-plugin\vcpkg.json pins both present in this
+# clone AND checked out -- fetched objects alone do not help, because vcpkg reads port
+# versions out of the working tree. That is true or false however the clone got there --
+# branch, tag, detached HEAD or fork -- so both modes ask it, and both are gated on the same
+# answer. It is the LIBRARY's definition, deliberately: a local copy here would drift from
+# the one 90-verify will consume, and a gate is only as strong as its weakest copy.
+$usable = $null
+if (Test-Path (Join-Path $VcpkgDir '.git')) {
+    $usable = Test-VcpkgUsable -VcpkgDir $VcpkgDir
+}
+
+# THE REPAIR. What it does is unchanged; what changed is who asks for it -- the predicate
+# above, rather than rev-list arithmetic that mistook "I could not measure this" for "nothing
+# to do". A clone that already carries the pinned baseline is now left completely alone: this
+# script has no business fetching into, or fast-forwarding, a working clone nobody asked it to
+# change.
+# An EXISTING clone goes stale, and a stale vcpkg breaks manifests two different ways:
+#   1. The pinned `builtin-baseline` commit isn't present at all ->
+#      "failed to `git show` versions/baseline.json ... exists on disk, but not in <sha>"
+#   2. The commit IS present but the CHECKED-OUT versions/ database predates the versions
+#      that baseline names -> "no version database entry for spdlog at 1.17.0"
+# Both read like a corrupt checkout rather than an old one. Fetching alone only fixes (1),
+# because vcpkg looks port versions up in the working tree -- so fast-forward as well.
+# Safe for pinned manifests: a newer tree is a superset of version entries, and each
+# project still resolves against its own builtin-baseline.
+if ($usable -and $usable.Status -ne 'OK' -and -not $CheckOnly) {
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     git -C $VcpkgDir fetch origin --quiet
@@ -123,11 +177,53 @@ elseif (-not $CheckOnly) {
             }
         }
     }
-    else { Write-Host 'vcpkg is up to date.' }
+    else {
+        # This is where 'vcpkg is up to date.' used to be printed, and that claim is the whole
+        # of this defect. Reaching here now means the predicate said the clone is NOT usable
+        # and nothing was fast-forwarded, so there is nothing to celebrate -- only a state to
+        # name. $behind is EMPTY when rev-list could not answer at all (detached HEAD, tag
+        # checkout, or a branch with no upstream: it exits 128 with its stderr discarded) and
+        # '0' when the checkout really is level with its upstream.
+        # The fetch above may still have been enough on its own, because it brings the pinned
+        # baseline COMMIT into the object database -- failure (1). What no fetch can do is
+        # advance the CHECKED-OUT versions/ tree, which is failure (2). Neither this branch nor
+        # the two above get to decide that: the postcondition below re-runs the tool.
+        if ("$behind".Trim()) {
+            Write-Warning "vcpkg at $VcpkgDir is level with its upstream and still not usable; fetched, but there was nothing to fast-forward."
+        }
+        else {
+            Write-Warning "vcpkg at $VcpkgDir is not on a branch tracking origin (detached HEAD, tag checkout, or no upstream), so nothing could be fast-forwarded and this clone stays pinned where you put it. If a build then reports 'no version database entry for <port> at <version>', its versions/ database predates the manifest baseline: check out a branch that tracks origin (git -C $VcpkgDir checkout master), or pin the manifest's builtin-baseline to a commit this checkout contains."
+        }
+    }
+
+    # POSTCONDITION. The do-path has to finish by PROVING the state it was asked to produce,
+    # not by reaching the end of its own code: "fetch returned 0 and merge returned 0" is a
+    # report about two commands, not about whether this vcpkg can resolve the manifest. Same
+    # predicate and same four-property answer that -CheckOnly gets, so a repair that did not
+    # take fails the run on exactly the evidence a check run would have shown. It has to be the
+    # CLONE predicate, not the shared one: the fetch two branches up puts the baseline commit in
+    # the object database whether or not anything was fast-forwarded, so the object test alone
+    # would report OK for the detached-HEAD and refused-dirty cases purely because the repair
+    # touched the object store -- the postcondition would be passing itself.
+    $usable = Test-VcpkgUsable -VcpkgDir $VcpkgDir
 }
-if ((Test-Path $VcpkgDir) -and -not (Test-Path (Join-Path $VcpkgDir 'vcpkg.exe'))) {
-    if ($CheckOnly) { Write-Host 'MISSING: vcpkg.exe (bootstrap not run)'; $ok = $false }
-    else { Invoke-Native 'bootstrap-vcpkg' { & (Join-Path $VcpkgDir 'bootstrap-vcpkg.bat') -disableMetrics } }
+
+# The one place either mode announces the answer, so a check run and a real run cannot disagree
+# about what "ready" means. Write-ProbeResult prints the exact command underneath a FAIL,
+# because the first thing anyone does with "vcpkg is not usable" is try to reproduce it by
+# hand. A clone that is unusable and could not be repaired FAILS here -- which is precisely
+# what the 'vcpkg is up to date.' path never did.
+if ($usable) {
+    Write-ProbeResult -Result $usable
+    if ($usable.Status -ne 'OK') {
+        $ok = $false
+        if ($CheckOnly) {
+            Write-Host "  Re-run this script without -CheckOnly to repair it: it bootstraps a clone that has no vcpkg.exe, and fetches origin and fast-forwards one whose checkout is behind."
+        }
+        else {
+            Write-Host "  The repair ran and this clone is still not usable. Fast-forward $VcpkgDir onto origin by hand (it may be pinned to a tag, or origin may be a fork), then re-run bootstrap-vcpkg.bat -disableMetrics."
+        }
+    }
 }
 
 if ($NoEnv) {
@@ -137,9 +233,12 @@ if ($NoEnv) {
     # command left behind. On a fully SUCCESSFUL run against a detached-HEAD or tag-pinned
     # clone that is `git rev-list --count HEAD..@{u}`, which exits 128 with its stderr
     # suppressed -- so a caller gating on the exit code reported a failure that never
-    # happened. Exit explicitly instead. A -CheckOnly miss found above still has to win,
-    # because skipping the env work is not permission to call an incomplete vcpkg ready.
-    if ($CheckOnly -and -not $ok) { exit 1 }
+    # happened. Exit explicitly instead. A miss found above still has to win, because skipping
+    # the env work is not permission to call an incomplete vcpkg ready -- and that is no longer
+    # only a -CheckOnly concern: the readiness predicate can now report a clone the repair
+    # could not make usable, on the very path (-NoEnv, used by CI) whose next step is a
+    # configure that would fail on the baseline it was never told about.
+    if (-not $ok) { exit 1 }
     exit 0
 }
 
@@ -179,7 +278,12 @@ if (-not $trip) {
     }
 }
 
-if ($CheckOnly -and -not $ok) { exit 1 }
+# No longer -CheckOnly's gate alone. A real run that could not make this clone usable must not
+# reach the line below: 'vcpkg ready.' is the sentence a stale, tag-pinned or forked clone used
+# to get on its way to exit 0, and it is the last thing anyone reads before blaming CMake for
+# "no version database entry for spdlog at 1.17.0". The env vars above have still been pointed
+# at $VcpkgDir -- that half of the job did succeed; what failed is the clone they name.
+if (-not $ok) { exit 1 }
 Write-Host 'vcpkg ready. NOTE: env vars set at User scope — new terminals see them; this one was updated in-place.'
 
 # $LASTEXITCODE is set by native commands, not by a .ps1 falling off the end -- without
