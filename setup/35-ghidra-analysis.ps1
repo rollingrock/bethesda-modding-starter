@@ -14,8 +14,12 @@
     need to run for this game?" with -CheckOnly and never start an hours-long job by accident.
 
     SCOPE IS THE exes/ TREE. Option 7 processes every staged binary. Use -OnlyGame to run one
-    game: the others are moved aside for the duration and restored afterwards, including on
-    failure or Ctrl-C.
+    game: the others are moved aside into .exes-held for the duration and restored afterwards.
+    The planned moves are written to .exes-held\.restore.json BEFORE anything is moved, and
+    EVERY run of this script restores from that record on the way in. So the borrowed binaries
+    come back not only on failure or Ctrl-C (the finally block) but also after a hard kill --
+    a closed terminal window, Stop-Process, a power cut, or a Windows Update reboot partway
+    through an hours-long analysis -- none of which ever reach a finally block.
 
     THIS IS SLOW. Ghidra auto-analysis is hours per binary. Run it detached (or overnight) and
     do not interrupt it. -CheckOnly is instant.
@@ -28,7 +32,12 @@
 param(
     [string]$BgsRoot = 'C:\repos\BethesdaGhidraScripts',
 
-    # Report what would run; change nothing. Exit 0 = nothing to do, 2 = work is pending.
+    # Report what would run; start nothing. Exit 0 = nothing to do, 2 = work is pending.
+    # The one thing it does change is repairing a previous run's damage: binaries stranded
+    # under .exes-held by an interrupted -OnlyGame run are moved back before the staging scan
+    # reads exes\ (see the custody-record block below). Withholding that here would make
+    # -CheckOnly report "nothing to do" for a game whose binary it had just declined to
+    # reclaim -- the silent-loss answer this record exists to prevent.
     [switch]$CheckOnly,
 
     # Restrict the run to one game directory under exes\ (skyrim, f4, starfield, fnv).
@@ -69,6 +78,102 @@ $ghidraDir   = Join-Path $BgsRoot 'tools\ghidra'
 $markerPath  = Join-Path $BgsRoot '.analysis-verified.json'
 $ProjectName = 'BethesdaGhidraScripts'
 $projectRoot = Join-Path $BgsRoot "ghidraprojects\$ProjectName"
+
+# ---- Custody record for borrowed game binaries ----
+# -OnlyGame moves the other games' staged binaries aside so option 7 does not analyze them.
+# Those are the user's own game installs -- they cannot be re-downloaded -- so the move has to
+# be reversible by a LATER process, not just by this one's finally block. The run that needs
+# holding is by definition the slow one (hours per binary, documented above as "run it
+# detached (or overnight)"), which is exactly the run a closed terminal window, a Stop-Process,
+# a power cut or a Windows Update reboot interrupts, and none of those unwind a finally.
+# So the planned moves go on disk BEFORE anything moves, and every run reads that record back.
+#
+# These live here, above the staging scan, only because the self-heal below has to run before
+# the scan -- PowerShell binds function calls at runtime in script order, so the definition
+# must precede the call.
+$holdRoot   = Join-Path $BgsRoot '.exes-held'
+$restoreLog = Join-Path $holdRoot '.restore.json'
+
+# Puts back everything the record says is held, and returns how many it moved. Cheap and safe
+# to call when nothing is held: no record file means nothing to do.
+function Restore-HeldExes {
+    if (-not (Test-Path $script:restoreLog)) { return 0 }
+
+    $entries = @()
+    try {
+        # Windows PowerShell 5.1's ConvertFrom-Json hands a JSON array back as ONE object
+        # rather than enumerating it, so @( ...| ConvertFrom-Json ) collects a single nested
+        # Object[] and the loop below runs ONCE with $m bound to the whole set. $m.From then
+        # member-enumerates to an ARRAY of paths, Test-Path returns an array of booleans, and
+        # a non-empty array is truthy -- so every entry looks "re-staged" and nothing is ever
+        # restored. Wrap the VARIABLE, not the pipeline: @($alreadyAnArray) keeps its length.
+        $parsed  = Get-Content $script:restoreLog -Raw -Encoding UTF8 | ConvertFrom-Json
+        $entries = @($parsed)
+    }
+    catch {
+        # Never guess. Without the record we do not know where these belong, and deleting or
+        # relocating a game binary on a hunch is the failure this whole record exists to avoid.
+        Write-Warning ("Held-binary record $($script:restoreLog) is unreadable: " + $_.Exception.Message)
+        Write-Warning ("  Move the .exe files under $($script:holdRoot) back into exes\ by hand, then " +
+                       "delete that record. Nothing here will touch them.")
+        return 0
+    }
+
+    # An entry missing either end of the move is as useless as an unreadable file, and worse
+    # than useless here: Test-Path on a null path throws, and this function also runs from a
+    # finally block where that would replace whatever error was actually being reported.
+    if (@($entries | Where-Object { -not $_.From -or -not $_.To }).Count) {
+        Write-Warning ("Held-binary record $($script:restoreLog) has incomplete entries; nothing was restored.")
+        Write-Warning ("  Move the .exe files under $($script:holdRoot) back into exes\ by hand, then " +
+                       "delete that record.")
+        return 0
+    }
+
+    $restored  = 0
+    $stillHeld = 0
+    foreach ($m in $entries) {
+        # Missing source = already restored by an earlier run, or the crash beat the move.
+        # Recording a move that never happened is harmless; this is why we record first.
+        if (-not (Test-Path $m.From)) { continue }
+        # No -Force, ever, in this direction. A target that exists again means the user
+        # re-staged that binary while ours was held aside, so their copy is the live one --
+        # overwriting it would destroy a file this script did not create. Keep both, say so,
+        # and leave the entry in the record so the state stays visible.
+        if (Test-Path $m.To) {
+            Write-Warning ("Not restoring $($m.From): $($m.To) exists again -- it was re-staged since " +
+                           "the run that moved it started.")
+            Write-Host   ('    Both copies are on disk; keep whichever one you want and delete the other.')
+            $stillHeld++
+            continue
+        }
+        New-Item -ItemType Directory -Force (Split-Path $m.To) | Out-Null
+        Move-Item $m.From $m.To
+        $restored++
+    }
+
+    # Drop the record only after a COMPLETE restore. While anything is still held, this file is
+    # the only thing on disk that knows where it belongs, so the next run must still find it.
+    if ($stillHeld -eq 0) {
+        Remove-Item $script:restoreLog -Force -ErrorAction SilentlyContinue
+        if ((Test-Path $script:holdRoot) -and -not (Get-ChildItem $script:holdRoot -Recurse -File)) {
+            Remove-Item $script:holdRoot -Recurse -Force
+        }
+    }
+    return $restored
+}
+
+# Self-heal before anything else looks at exes\. This repairs damage left by a previous run
+# rather than starting work, so it happens even under -CheckOnly (which still cannot start an
+# analysis -- its early exit is below and no move happens before it). It has to happen BEFORE
+# the staging scan because that scan only looks under exes\: a binary stranded in .exes-held
+# would otherwise just be absent from the staged table, the run would report success for the
+# one game it did analyze, and the user's un-redownloadable copy of the other game would have
+# left the pipeline with nothing ever mentioning it.
+$strandedRestored = Restore-HeldExes
+if ($strandedRestored -gt 0) {
+    Write-Host ''
+    Write-Host ("Restored {0} game binar{1} stranded by an interrupted -OnlyGame run (from {2})." -f $strandedRestored, $(if ($strandedRestored -eq 1) { 'y' } else { 'ies' }), $holdRoot)
+}
 
 # ---- What is staged? (mirrors BGS's own _discover_exes: exes\<game>\<ver>\*.exe) ----
 $staged = @()
@@ -188,28 +293,61 @@ if ($CheckOnly) {
 }
 
 # ---- Scope the exes\ tree if asked ----
-$holdRoot = Join-Path $BgsRoot '.exes-held'
-$moved = @()
-function Restore-HeldExes {
-    foreach ($m in $script:moved) {
-        if (Test-Path $m.From) {
-            New-Item -ItemType Directory -Force (Split-Path $m.To) | Out-Null
-            Move-Item $m.From $m.To -Force
-        }
-    }
-    if ((Test-Path $script:holdRoot) -and -not (Get-ChildItem $script:holdRoot -Recurse -File)) {
-        Remove-Item $script:holdRoot -Recurse -Force
-    }
-}
-
+# $holdRoot, $restoreLog and Restore-HeldExes are defined near the top of the script instead of
+# here, because the self-heal that reclaims a previous run's held binaries has to run before
+# the staging scan. See the custody-record block up there for why the record exists at all.
 try {
     if ($OnlyGame) {
+        $newMoves = @()
         foreach ($s in $staged | Where-Object { $_.Game -ne $OnlyGame }) {
-            $rel  = $s.Exe.Substring($exesRoot.Length).TrimStart('\')
-            $dest = Join-Path $holdRoot $rel
-            New-Item -ItemType Directory -Force (Split-Path $dest) | Out-Null
-            Move-Item $s.Exe $dest -Force
-            $moved += [pscustomobject]@{ From = $dest; To = $s.Exe }
+            $rel = $s.Exe.Substring($exesRoot.Length).TrimStart('\')
+            $newMoves += [pscustomobject]@{ From = (Join-Path $holdRoot $rel); To = $s.Exe }
+        }
+        if ($newMoves.Count) {
+            # A record can outlive the self-heal above: the restore refuses to overwrite a
+            # binary the user re-staged and leaves that entry held. The record has to describe
+            # EVERYTHING currently under .exes-held or that leftover is stranded all over
+            # again, so carry the surviving entries forward rather than overwriting the file.
+            $carried = @()
+            if (Test-Path $restoreLog) {
+                $prior = $null
+                # No @() around the pipeline here either -- see Restore-HeldExes. Wrapping it
+                # would nest the whole record inside one element, and ConvertTo-Json below
+                # would then write a record nested one level too deep for any future run to
+                # read back.
+                try { $prior = Get-Content $restoreLog -Raw -Encoding UTF8 | ConvertFrom-Json }
+                catch {
+                    throw ("Cannot read the held-binary record $restoreLog, and overwriting it would " +
+                           "strand whatever is under $holdRoot. Move those .exe files back under exes\ " +
+                           "by hand, delete the record, then re-run.")
+                }
+                $carried = @(@($prior) | Where-Object { $_ -and $_.From -and (Test-Path $_.From) })
+            }
+            New-Item -ItemType Directory -Force $holdRoot | Out-Null
+            # Written BEFORE the first Move-Item, deliberately. A crash after a move but before
+            # the record would leave a binary sitting outside exes\ with nothing on disk saying
+            # where it came from -- which is the exact way these get lost. The other order is
+            # harmless: the restore skips any entry whose source never appeared.
+            # A carried entry and a new move can name the same held path (the user re-staged a
+            # binary we are still holding). Keep one entry per held path so a run that is
+            # refused below and retried does not grow the record -- and its warnings -- forever.
+            $record = @()
+            $seen   = @{}
+            foreach ($m in @($carried + $newMoves)) {
+                if ($seen.ContainsKey($m.From)) { continue }
+                $seen[$m.From] = $true
+                $record += $m
+            }
+            ConvertTo-Json @($record) | Set-Content $restoreLog -Encoding UTF8
+            foreach ($m in $newMoves) {
+                if (Test-Path $m.From) {
+                    throw ("$($m.From) already exists -- an earlier interrupted run is still holding a " +
+                           "copy of $($m.To). Overwriting it would destroy a game binary this script did " +
+                           "not create. Decide which copy you want, delete the other, then re-run.")
+                }
+                New-Item -ItemType Directory -Force (Split-Path $m.From) | Out-Null
+                Move-Item $m.To $m.From
+            }
         }
     }
 
@@ -272,7 +410,10 @@ try {
     }
 }
 finally {
-    Restore-HeldExes
+    # The fast path back: a normal exit, a throw, or Ctrl-C restores here immediately. It is no
+    # longer the ONLY path -- the record on disk plus the self-heal at the top cover the kills
+    # that never reach a finally. The count it returns is only interesting to the self-heal.
+    Restore-HeldExes | Out-Null
 }
 
 # ---- Report the outcome ----
