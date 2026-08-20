@@ -52,6 +52,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot\_common.ps1"
 
 if (-not (Test-Path $BgsRoot)) {
     throw "BethesdaGhidraScripts not found at $BgsRoot. Run setup\20-repos.ps1 first."
@@ -197,7 +198,20 @@ if (Test-Path $exesRoot) {
 }
 
 # ---- What is already done? ----
-$toolsReady   = Test-Path $ghidraDir
+# The directory existing is not the toolchain being installed. Menu 1 unzips the Ghidra
+# distribution into tools\ghidra, so a menu 1 killed mid-unzip -- or one that ran out of disk,
+# or an older Ghidra left behind by a previous BGS revision -- leaves that directory sitting
+# there and a bare Test-Path calls it done. Menu 1 is then skipped on the exact machine that
+# needs it, and the failure lands HOURS later inside BethesdaGhidraScripts, against a Ghidra
+# missing the modules the import needs. Worse, run.py reports that as its own "ERROR: ..."
+# line and still exits 0, so it clears the traceback check below and the run reads as a pass.
+# Ask the shared predicate instead of the filesystem: application.properties must parse, the
+# processor modules -- which sit at the FAR end of the archive, where a truncated extraction
+# stops -- must be present, and the jar count must clear a floor. A half-extracted tree is
+# then NOT ready and menu 1 runs again. Measured at ~110ms on a real install, so -CheckOnly
+# stays instant as documented above.
+$ghidraProbe  = Test-GhidraInstallComplete -Path $ghidraDir
+$toolsReady   = ($ghidraProbe.Status -eq 'OK')
 $projectReady = Test-Path $projectGpr
 
 # Ask git rather than guessing a path: `submodule status` prefixes uninitialised entries with
@@ -218,7 +232,12 @@ if (Test-Path $markerPath) {
 
 Write-Host ''
 Write-Host "BethesdaGhidraScripts at $BgsRoot"
-Write-Host ("  tools (Ghidra/Clang/...) : " + $(if ($toolsReady) { 'installed' } else { 'MISSING -> menu 1' }))
+# Print what was OBSERVED, not the word 'installed'. That word over a half-extracted tree is
+# the whole of this defect: it told the user the toolchain was fine right up to the point the
+# build failed inside BGS. A version, a processor-module count and a jar count are something a
+# human can compare against a working machine; on failure the probe's Detail names which of
+# the three gave way, so 'menu 1' is a repair with a reason attached rather than a guess.
+Write-Host ("  tools (Ghidra/Clang/...) : " + $(if ($toolsReady) { $ghidraProbe.Detail } else { 'NOT USABLE -> menu 1: ' + $ghidraProbe.Detail }))
 Write-Host ("  CommonLib submodules     : " + $(if ($submodsReady) { 'restored' } else { 'MISSING -> menu 2' }))
 Write-Host ("  Ghidra project           : " + $(if ($projectReady) { 'present' } else { 'not created' }))
 Write-Host ("  Verified analysis for    : " + $(if ($verifiedGames.Count) { $verifiedGames -join ', ' } else { 'nothing yet' }))
