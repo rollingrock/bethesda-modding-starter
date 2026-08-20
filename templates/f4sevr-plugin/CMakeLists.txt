@@ -285,6 +285,39 @@ endif()
 # Only the DLL/PDB are copied; config files are deployed by hand so a rebuild
 # never clobbers values you are live-tuning in the mod folder.
 if(DEFINED MO2_INSTALL_PATH AND NOT "${MO2_INSTALL_PATH}" STREQUAL "")
+	# Check the path at CONFIGURE time, because the POST_BUILD deploy below is incapable of
+	# failing: `cmake -E make_directory` deep-creates ANY path it is handed and returns 0. The
+	# unedited C:/MO2/... placeholder from CMakeUserPresets.json.template, a typo, or an
+	# instance-mode MO2 (whose real mods live under %LOCALAPPDATA%/ModOrganizer/<game>/mods)
+	# therefore all built green with the DLL sitting in a freshly invented tree no MO2 instance
+	# ever reads -- no plugin, no F4SE log, no error anywhere. The COPY_BUILD arm above gets
+	# this for free by creating nothing; this arm has to check for itself.
+	#
+	# Which ancestor must already exist is narrower than it looks. MO2_INSTALL_PATH is
+	# documented and generated as <mo2>/mods/<yourmod>/F4SE/Plugins, and for a new mod neither
+	# the F4SE/Plugins leaf nor <yourmod> exists yet -- creating those is exactly what the
+	# make_directory below is for. The mods root above them is MO2's own; if THAT is missing
+	# the path is simply not pointing at an MO2 install. So strip a trailing F4SE/Plugins
+	# (character class by character class, since cmake regex has no /i and people write
+	# F4SE/plugins) and require the parent of whatever is left.
+	file(TO_CMAKE_PATH "${MO2_INSTALL_PATH}" MO2_DEPLOY_PATH)
+	string(REGEX REPLACE "/+$" "" MO2_DEPLOY_PATH "${MO2_DEPLOY_PATH}")
+	string(REGEX REPLACE "/[Ff]4[Ss][Ee]/[Pp][Ll][Uu][Gg][Ii][Nn][Ss]$" "" MO2_MOD_DIR "${MO2_DEPLOY_PATH}")
+	get_filename_component(MO2_MODS_ROOT "${MO2_MOD_DIR}" DIRECTORY)
+
+	if(NOT IS_DIRECTORY "${MO2_MODS_ROOT}")
+		message(
+			FATAL_ERROR
+			"MO2_INSTALL_PATH is set to \"${MO2_INSTALL_PATH}\", but the folder that would have "
+			"to hold the mod -- \"${MO2_MODS_ROOT}\" -- is not an existing folder, so this build "
+			"would copy the DLL into a tree no MO2 instance reads. MO2_INSTALL_PATH must point "
+			"at <mo2>/mods/<yourmod>/F4SE/Plugins, where <mo2>/mods is the mods folder MO2 "
+			"already uses (MO2 > Settings > Paths; an instance-mode MO2 keeps it under "
+			"%LOCALAPPDATA%/ModOrganizer/<game>/mods). Fix it in CMakeUserPresets.json and "
+			"configure again."
+		)
+	endif()
+
 	add_custom_command(
 		TARGET ${PROJECT_NAME}
 		POST_BUILD

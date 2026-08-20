@@ -90,6 +90,47 @@ $token = ($Name -replace '-', '_').ToLowerInvariant()
 $vcpkgName = ($Name -replace '_', '-').ToLowerInvariant()
 
 if ($Game -in 'F4VR', 'F4') {
+    # -Mo2Path used to be written into the preset sight unseen -- no Test-Path anywhere, and the
+    # preset writer below appends /F4SE/Plugins to whatever it was handed. Hand it the mods ROOT
+    # (a fair reading of "MO2 mod folder") and you get <mods>/F4SE/Plugins: a mod literally named
+    # F4SE, laid out wrong (F4SE loads <mod>/F4SE/Plugins/x.dll, that produces <mod>/Plugins/x.dll),
+    # so the plugin never loads however carefully you enable it in MO2. A typo'd path was accepted
+    # just as happily. Both were then reported as success. Check it here, before the scaffold copies
+    # a single file and long before the multi-minute CommonLibF4 submodule clone, so a wrong path
+    # costs seconds instead of a whole run.
+    if ($Mo2Path) {
+        # A full .../F4SE/Plugins path is a legitimate thing to pass (the preset writer below
+        # tolerates it too), so strip that leaf off first to get at the mod folder itself.
+        $mo2ModDir = $Mo2Path.TrimEnd('\', '/') -replace '[\\/]F4SE[\\/]Plugins$', ''
+        # Split-Path hard-errors on a bare drive spec ("C:", what -Mo2Path "C:\" trims down to)
+        # instead of returning an empty parent, so only hand it a path that has a separator to
+        # split on. Anything without one is a bare segment and has no parent either way.
+        $mo2Root = ''
+        if ($mo2ModDir -match '[\\/]') { $mo2Root = Split-Path $mo2ModDir -Parent }
+        if (-not $mo2Root) {
+            throw "-Mo2Path must be the full path to the mod folder, like C:\MO2\Fallout4VR\mods\$Name (got: $Mo2Path)."
+        }
+        if ((Split-Path $mo2ModDir -Leaf) -eq 'mods') {
+            throw @"
+-Mo2Path points at the MO2 mods ROOT ($Mo2Path). Pass the mod's own folder instead:
+  -Mo2Path "$mo2ModDir\$Name"
+MO2 shows every subfolder of mods as a separate mod, so deploying into the root would make one
+called "F4SE" whose internal layout F4SE cannot load.
+"@
+        }
+        # The mod folder itself not existing yet is normal -- this scaffolds a NEW mod, and the
+        # build creates that folder on its first deploy. Its parent, the mods root, is MO2's own
+        # and must already be there; if it is not, the path is pointing somewhere MO2 is not.
+        if (-not (Test-Path -LiteralPath $mo2Root -PathType Container)) {
+            throw @"
+-Mo2Path is $Mo2Path, but its parent $mo2Root is not an existing folder -- MO2 would never list
+the mod, and every build would deploy the DLL into a tree nothing reads. Point -Mo2Path at
+<mo2>\mods\<yourmod>; MO2 > Settings > Paths shows the mods folder it really uses (an
+instance-mode MO2 keeps it under %LOCALAPPDATA%\ModOrganizer\<game>\mods).
+"@
+        }
+    }
+
     Write-Host "Scaffolding $Name from templates/f4sevr-plugin ..."
     Copy-Item -Recurse (Join-Path $packRoot 'templates\f4sevr-plugin') $target
     # Never carry a test build over into a new project.
