@@ -101,14 +101,15 @@ jobs:
         shell: powershell
         run: |
           $bad = @()
+          $script:scanned = 0
           Get-ChildItem .github\workflows -Filter *.yml -File | ForEach-Object {
               $wf = $_.Name
-              # Crude but dependency-free: take every `run: |` block that a `shell: powershell`
-              # line applies to. Good enough to catch pwsh-7-only syntax.
+              # Crude but dependency-free: take every `run:` value -- block scalar OR
+              # one-liner -- that a `shell: powershell` line applies to. Good enough to
+              # catch pwsh-7-only syntax.
               $lines = Get-Content $_.FullName
-              $inRun = $false; $indent = 0; $buf = @(); $isPs = $false; $blockStart = 0
+              $before = $script:scanned
               function Test-Block($wf, $start, $text, [ref]$bad) {
-                  if (-not $text.Trim()) { return }
                   # Strip GitHub expression interpolations before parsing: they are
                   # substituted before the shell ever sees them, and their contents are not
                   # PowerShell. (Deliberately not writing that syntax out literally here --
@@ -122,28 +123,71 @@ jobs:
                       Write-Host "FAIL $wf (block at line $start): $($errs[0].Message)"
                   }
               }
+              # Blocks are collected per STEP and tested only when the step ends. `run:` and
+              # `shell:` are two keys of one mapping, so either order is valid YAML and means
+              # the same thing -- testing a block the instant it closed required shell: to
+              # have been read first, and silently skipped any step that wrote run: first.
+              function Test-Pending($wf, $blocks, $isPs, [ref]$bad) {
+                  if (-not $isPs) { return }
+                  foreach ($b in $blocks) {
+                      if (-not $b.Text.Trim()) { continue }
+                      $script:scanned++
+                      Test-Block $wf $b.Start $b.Text $bad
+                  }
+              }
+              $pending = @(); $isPs = $false
+              $inRun = $false; $indent = 0; $buf = @(); $blockStart = 0
               for ($i = 0; $i -lt $lines.Count; $i++) {
                   $line = $lines[$i]
                   if ($inRun) {
                       $cur = $line.Length - $line.TrimStart().Length
                       if ($line.Trim() -eq '' -or $cur -ge $indent) { $buf += $line; continue }
-                      if ($isPs) { Test-Block $wf $blockStart ($buf -join "`n") ([ref]$bad) }
+                      $pending += [pscustomobject]@{ Start = $blockStart; Text = ($buf -join "`n") }
                       $inRun = $false; $buf = @()
                   }
+                  # Reached here, a list item is outside any run: block, so it opens a new
+                  # step: judge what the finished one collected, then start over.
+                  if ($line -match '^\s*-\s') {
+                      Test-Pending $wf $pending $isPs ([ref]$bad)
+                      $pending = @(); $isPs = $false
+                  }
                   if ($line -match '^\s*shell:\s*powershell\s*$') { $isPs = $true }
-                  if ($line -match '^\s*-\s') { if (-not $inRun) { $isPs = $false } }
                   if ($line -match '^(\s*)run:\s*\|') {
                       $inRun = $true; $indent = $Matches[1].Length + 2; $buf = @(); $blockStart = $i + 1
                   }
+                  elseif ($line -match '^\s*run:\s*([^|>\s].*)$') {
+                      # A single-line `run:` value, which this scanner used to ignore
+                      # entirely -- so the step that actually invokes 30-ghidra.ps1 and the
+                      # one-liner at the top of this file were both unchecked.
+                      $pending += [pscustomobject]@{ Start = ($i + 1); Text = $Matches[1] }
+                  }
               }
-              if ($inRun -and $isPs) { Test-Block $wf $blockStart ($buf -join "`n") ([ref]$bad) }
+              if ($inRun) { $pending += [pscustomobject]@{ Start = $blockStart; Text = ($buf -join "`n") } }
+              Test-Pending $wf $pending $isPs ([ref]$bad)
+              Write-Host ("  {0,-22} {1} block(s)" -f $wf, ($script:scanned - $before))
           }
           if ($bad.Count) {
               Write-Host ''
               Write-Host 'Inline workflow PowerShell must be 5.1-compatible (no ternary, no ??).'
               exit 1
           }
-          Write-Host 'Inline workflow PowerShell parses under 5.1.'
+          # A floor on how much was actually scanned. The heuristics above are matched
+          # against YAML text, so they can quietly stop matching -- and with nothing to
+          # scan this step printed its success line over an EMPTY scan, a check that passes
+          # because it checked nothing. Measured on this repo 2026-08-20: 33 blocks across
+          # the four workflow files (the per-file tally above is where that came from). The
+          # floor sits nine under it so ordinary step churn never turns CI red, while the
+          # failure this guards -- the run:/shell: matching breaking and the scan
+          # collapsing toward zero -- lands far below it.
+          $floor = 24
+          if ($script:scanned -lt $floor) {
+              Write-Host ''
+              Write-Host "Only $($script:scanned) inline PowerShell block(s) scanned; expected at least $floor."
+              Write-Host 'The run:/shell: matching above has stopped finding this repo. Fix the scan --'
+              Write-Host 'lowering the floor instead just restores a check that checks nothing.'
+              exit 1
+          }
+          Write-Host "Inline workflow PowerShell parses under 5.1 ($($script:scanned) block(s) scanned)."
 
       # GitHub evaluates its expression interpolations ANYWHERE in a workflow file --
       # including inside a run: block, and including a comment inside that block. One
@@ -180,21 +224,34 @@ jobs:
 
       # Smoke test: these must EXECUTE, not merely parse. A bare runner is missing most
       # components, so a non-zero exit is expected and fine -- we only fail on a thrown
-      # error (a real scripting bug). winget is absent from some runner images, which
-      # 00-prereqs.ps1 correctly throws on; that one is tolerated explicitly.
+      # error (a real scripting bug). Exactly ONE thrown message is tolerated: winget is
+      # absent from some runner images and 00-prereqs.ps1 correctly throws
+      # 'winget is not available. Install "App Installer" ...' when it is.
+      #
+      # That tolerance is matched against the MESSAGE, never blanket. It used to be a
+      # -AllowThrow switch that swallowed every exception, which made this step physically
+      # incapable of failing on 00-prereqs.ps1: a typo'd cmdlet, a null method call, a
+      # crash on line 1 all printed "threw (tolerated)" and left the step green. The script
+      # that installs everything on a fresh machine had zero enforceable coverage.
       - name: Setup scripts run their -CheckOnly path
         shell: powershell
         run: |
           $hardFail = $false
-          function Smoke([string]$label, [scriptblock]$body, [switch]$AllowThrow) {
+          function Smoke([string]$label, [scriptblock]$body, [string]$TolerateMessage) {
               Write-Host "=== $label ==="
               try { & $body; Write-Host "$label exit=$LASTEXITCODE (non-zero is expected on CI)" }
               catch {
-                  if ($AllowThrow) { Write-Host "$label threw (tolerated): $_" }
-                  else { Write-Host "$label THREW: $_"; $script:hardFail = $true }
+                  # Print the message on BOTH paths: a tolerated throw that quietly stopped
+                  # matching what the script actually says is how this rots back into a
+                  # blanket catch, and the log is where that gets noticed.
+                  $msg = $_.Exception.Message
+                  if ($TolerateMessage -and $msg -match $TolerateMessage) {
+                      Write-Host "$label threw (tolerated, expected on a runner without winget): $msg"
+                  }
+                  else { Write-Host "$label THREW: $msg"; $script:hardFail = $true }
               }
           }
-          Smoke '00-prereqs -CheckOnly' { .\setup\00-prereqs.ps1 -CheckOnly } -AllowThrow
+          Smoke '00-prereqs -CheckOnly' { .\setup\00-prereqs.ps1 -CheckOnly } 'winget is not available'
           Smoke '10-vcpkg -CheckOnly'   { .\setup\10-vcpkg.ps1 -CheckOnly -VcpkgDir "$env:RUNNER_TEMP\vcpkg" }
           Smoke '90-verify'             { .\setup\90-verify.ps1 }
           if ($hardFail) { Write-Host ''; Write-Host 'A setup script threw.'; exit 1 }

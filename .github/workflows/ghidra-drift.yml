@@ -1,57 +1,42 @@
-name: Ghidra MCP bringup
+name: Ghidra drift detector
 
-# Phase 4 is the part of this pack that kept breaking on a fresh machine, and every failure
-# was quiet: a winget package that does not exist, an extension built for the wrong Ghidra
-# version, a bridge that connects to nothing. This job runs the whole bringup on a clean
-# runner and asserts the things that were silently wrong before.
+# This is the Phase 4 bringup from ghidra-bringup.yml, re-run against Ghidra's LATEST
+# release instead of the pinned 12.0.4 this pack is verified against. Its job is to find out
+# that a new Ghidra broke ghidra-mcp's compile, or the version gate, or the headless
+# server, on a Monday morning here -- rather than on a user's fresh machine, where the
+# symptom is an extension Ghidra silently refuses to load. It skips only the error-path
+# assertions, which are about how this pack's own scripts report missing inputs and cannot
+# drift with a Ghidra release.
 #
-# WHAT THIS CANNOT COVER, deliberately: the analysis itself. 35-ghidra-analysis.ps1 needs
-# game executables staged under exes\<game>\<ver>\, and those come from the user's own game
-# installs -- they cannot be downloaded, and a full Bethesda binary takes HOURS against a
-# 6-hour job limit. So CI proves the bringup WORKS; only a real machine proves the database
-# is GOOD. The naming numbers in CLAUDE.md stay hand-measured for that reason.
+# WHY THIS IS A SEPARATE FILE and not a second matrix leg in ghidra-bringup.yml: as a leg
+# it needed continue-on-error, because a Ghidra release that ghidra-mcp has not caught up
+# with yet must never block an unrelated PR. But continue-on-error makes a leg incapable of
+# failing the RUN, and a failed run conclusion is the only thing GitHub sends mail about --
+# so the detector detected and told nobody: it wrote the breakage into a step summary
+# inside a green run that nobody opens. Split out, it fails on its own and that failure is
+# the notification, with no gh-issue machinery needed; and it still cannot block a PR,
+# because it has no push or pull_request trigger at all. That is the entire point of the
+# split, so two things must stay true of this file: nothing in it may carry
+# continue-on-error, and no push/pull_request trigger belongs in it.
 #
-# What it does cover, with no game assets at all:
-#   * gradlew builds the extension (no Maven -- there is no Apache.Maven package in winget)
-#   * the version gate: extension.properties version == the install's application.version
-#   * the headless server starts, serves its endpoints, and loads a program
-#   * the BRIDGE registers tools against it -- the actual "an agent gets tools" contract,
-#     which /mcp/schema answering does not by itself prove
-#   * -Stop leaves no JVM behind (a killed one strands a project lock)
-#
-# This workflow runs ONE Ghidra version: 12.0.4, the known-good one this pack is verified
-# against, and every failure here is a real failure that blocks the push or the PR.
-#
-# The drift check against Ghidra's `latest` release lives in its own file,
-# ghidra-drift.yml. It used to ride along here as a second matrix leg carrying
-# continue-on-error so upstream's release timing could never block a PR -- but
-# continue-on-error means the leg cannot fail the RUN, and a failed run conclusion is the
-# only thing GitHub emails about. So the detector detected and told nobody: it wrote the
-# breakage into a step summary inside a green run that nobody opens. A separate scheduled
-# workflow fails on its own, which notifies, and still cannot block a PR here.
+# The step duplication with ghidra-bringup.yml is deliberate. These two are expected to
+# drift apart -- this one may need a workaround for an unreleased Ghidra that must never
+# reach the run that gates PRs -- and a reusable-workflow indirection would make the gating
+# path harder to read for no benefit at this size.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  schedule:
+    # Mondays 06:00 UTC -- catches a new Ghidra release without anyone pushing.
+    - cron: '0 6 * * 1'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  bringup:
-    name: Bringup (Ghidra ${{ matrix.ghidra }})
+  drift:
+    name: Drift check (Ghidra latest)
     runs-on: windows-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      # A one-entry matrix on purpose: the version reaches the job name, the release
-      # lookup, the cache key and the summary, so verifying the pack against the next
-      # Ghidra is one line here instead of a find-and-replace. Nothing in this workflow
-      # may carry continue-on-error -- that is precisely what left the old second leg
-      # unable to fail the run.
-      matrix:
-        ghidra: ['12.0.4']
 
     steps:
       - uses: actions/checkout@v5
@@ -74,11 +59,10 @@ jobs:
           $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'bethesda-modding-starter-ci' }
           $api = 'https://api.github.com/repos/NationalSecurityAgency/ghidra/releases?per_page=100'
           $releases = Invoke-RestMethod $api -Headers $headers
-          # Pinned tags only. Resolving Ghidra's `latest` release is ghidra-drift.yml's
-          # job; if it stayed an option here, one matrix typo would quietly turn the leg
-          # that gates PRs into a drift run against whatever shipped that morning.
-          $rel = $releases | Where-Object { $_.tag_name -eq 'Ghidra_${{ matrix.ghidra }}_build' } | Select-Object -First 1
-          if (-not $rel) { throw 'No matching Ghidra release for "${{ matrix.ghidra }}".' }
+          # Newest real release. Prereleases and drafts are excluded on purpose: drifting
+          # against something users cannot install would report breakage nobody can hit.
+          $rel = $releases | Where-Object { -not $_.prerelease -and -not $_.draft } | Select-Object -First 1
+          if (-not $rel) { throw 'The Ghidra releases API returned no published release.' }
           $asset = $rel.assets | Where-Object { $_.name -like 'ghidra_*_PUBLIC_*.zip' } | Select-Object -First 1
           if (-not $asset) { throw "Release $($rel.tag_name) has no ghidra_*_PUBLIC_*.zip asset." }
           # ghidra_12.0.4_PUBLIC_20260303.zip -> version 12.0.4, extracted dir ghidra_12.0.4_PUBLIC
@@ -92,8 +76,9 @@ jobs:
           "url=$($asset.browser_download_url)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
           "dir=C:\tools\ghidra_${ver}_PUBLIC"  | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      # ~400 MB per download; cache it so re-runs are cheap. The key is the asset name, so
-      # ghidra-drift.yml's `latest` download gets its own entry instead of colliding here.
+      # ~400 MB per download; cache it so this weekly run is cheap while Ghidra's latest
+      # release stays put. The key is the asset name, so the week a new one ships this
+      # misses and re-downloads, which is exactly the week we want a real download anyway.
       - name: Cache the Ghidra install
         id: ghidra-cache
         uses: actions/cache@v4
@@ -138,10 +123,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.gradle
-          key: gradle-${{ runner.os }}-${{ hashFiles('.github/workflows/ghidra-bringup.yml') }}
+          key: gradle-${{ runner.os }}-${{ hashFiles('.github/workflows/ghidra-drift.yml') }}
           restore-keys: gradle-${{ runner.os }}-
 
       # ---------------------------------------------------------------- the pack's own script
+      # This is the step drift usually breaks: GhidraMCP compiles against Ghidra's own jars,
+      # so a new release that moves or renames an API fails the build here.
       - name: 30-ghidra.ps1 (build + deploy the extension, create the bridge venv)
         shell: powershell
         run: .\setup\30-ghidra.ps1 -GhidraPath '${{ steps.rel.outputs.dir }}'
@@ -246,40 +233,18 @@ jobs:
           Write-Host 'Stopped cleanly: no JVM, port free.'
           Write-Host '::endgroup::'
 
-      # ---------------------------------------------------------------- error paths
-      # These are contracts an agent depends on: a script that fails clearly is the
-      # difference between "stage your EXEs" and an unattended run guessing.
-      - name: Scripts must fail clearly when their inputs are absent
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # BethesdaGhidraScripts is not cloned here (it is huge and needs game EXEs anyway),
-          # so 35-ghidra-analysis.ps1 must say so rather than half-run.
-          $threw = $false
-          try { .\setup\35-ghidra-analysis.ps1 -CheckOnly -BgsRoot 'C:\nope\not-here' }
-          catch { $threw = $true; Write-Host "expected throw: $_" }
-          if (-not $threw) { throw '35-ghidra-analysis.ps1 -CheckOnly did not fail on a missing BgsRoot.' }
-
-          # And -Start must refuse rather than run against a build that was never made.
-          Remove-Item .\setup\.ghidra-mcp-build.json -Force
-          $threw = $false
-          try { .\setup\36-ghidra-mcp.ps1 -Start }
-          catch { $threw = $true; Write-Host "expected throw: $_" }
-          if (-not $threw) { throw '36-ghidra-mcp.ps1 -Start did not fail with no build manifest.' }
-          Write-Host 'Both scripts failed clearly.'
-
       - name: Summary
         if: always()
         shell: powershell
         run: |
           $lines = @(
-            "## Ghidra MCP bringup - ${{ matrix.ghidra }}",
+            "## Ghidra MCP drift check - latest (${{ steps.rel.outputs.version }})",
             '',
             '| | |',
             '|---|---|',
             "| Ghidra | ${{ steps.rel.outputs.version }} (``${{ steps.rel.outputs.asset }}``) |",
             "| Result | ${{ job.status }} |",
-            "| Gating | yes - a failure here blocks the push or PR |"
+            "| Gating | no - this blocks no PR, but a red run here is the notification |"
           )
           $lines -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
