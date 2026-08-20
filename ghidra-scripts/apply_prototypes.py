@@ -28,14 +28,19 @@ WHY THIS IS NOT A ONE-LINER -- a demangled C++ name is missing two things:
 
 Phases (each cached, so you pay the slow one once):
 
-    fetch    pull the function list and the data-type index          (~20 s)
+    fetch    pull the function list and the data-type index, and     (~20 s)
+             stamp the cache with WHICH program they came from
     probe    decompile candidates to learn this-ness -- SLOW,        (~150 min for the full
              ~347 ms/function, resumable, safe to interrupt           corpus; --limit to trim)
     report   tier everything and write the proposed prototypes       (instant)
-    apply    validate then set, journalling every change             (~50 ms/function)
+    apply    validate then set, journalling every outcome            (~50 ms/function)
 
 Dry-run is the default. `apply` requires --apply, and even then validates every prototype
 against Ghidra's own parser first.
+
+A plan is bound to the program it was built from and will not be applied to a different one.
+The server serves whatever project setup\\36-ghidra-mcp.ps1 last loaded, and an address means
+nothing without the program it indexes. --ignore-program-mismatch overrides that.
 
     python apply_prototypes.py fetch
     python apply_prototypes.py probe --limit 2000
@@ -77,6 +82,129 @@ def _post(url: str, payload: dict, timeout: int = 300) -> str:
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------- which program is this?
+
+# NOTHING ELSE BINDS A PLAN TO A PROGRAM. The cache is a fixed .proto-cache directory with no
+# program in its name; a plan row carries only address/name/tier/this/prototype; and
+# /set_function_prototype takes an ADDRESS, so it writes into whatever 127.0.0.1:8089 happens
+# to be serving at the moment the POST lands. setup\36-ghidra-mcp.ps1 prints "Use -Stop first
+# if you need to change the loaded project or program" -- which is the sentence that admits
+# the loaded program can differ between the report and the apply. A plan applied to the wrong
+# program writes 13,108 prototypes at addresses that mean something else there, and every one
+# of them is counted APPLIED, because the server really did apply them.
+#
+# So `fetch` records who the server said it was, `report` copies that into the plan, and
+# `apply` reads it back and compares. The fields are split in two on purpose:
+#
+#   IDENTITY  must be identical, or the addresses index a different thing. base_address is
+#             here because a rebase moves every address in the plan while the program name
+#             stays the same; language/compiler/address_size because a plan for one
+#             architecture is meaningless on another.
+#   DRIFT     legitimately changes as analysis continues in the SAME program. Re-running
+#             auto-analysis or importing more names moves function_count and symbol_count
+#             without invalidating a single address the plan already holds, so a difference
+#             here is reported and never refused on.
+PROGRAM_IDENTITY_KEYS = ("program_name", "executable_path", "language", "compiler",
+                         "address_size_bits", "base_address")
+PROGRAM_DRIFT_KEYS = ("function_count", "symbol_count")
+
+
+def read_program_fingerprint(url: str) -> dict:
+    """Ask the server which program it is serving. Raises SystemExit if it will not say.
+
+    /get_metadata answers a FLAT object -- program_name, executable_path, base_address,
+    function_count and the rest -- or {"error":"No program loaded."}; it is not the
+    {"data":...} envelope some other endpoints use. setup\\36-ghidra-mcp.ps1 reads the same
+    endpoint the same way.
+
+    An answer we cannot read is NOT turned into a fingerprint. Recording {} and then comparing
+    {} against {} at apply time would pass every check while proving nothing -- which is
+    exactly the false "all clear" this record exists to prevent.
+    """
+    try:
+        meta = json.loads(_get(f"{url}/get_metadata", timeout=120))
+    except Exception as exc:                           # noqa: BLE001 - any failure is the same
+        raise SystemExit(f"ERROR: {url}/get_metadata did not answer ({exc}), so which program "
+                         f"is being served is unknown and nothing can be bound to it.")
+    if not isinstance(meta, dict) or not meta.get("program_name"):
+        raise SystemExit(f"ERROR: {url}/get_metadata reports no program: {str(meta)[:200]}\n"
+                         f"       Start the server with one: "
+                         f"setup\\36-ghidra-mcp.ps1 -Start -Program <path in project>")
+    fp = {k: meta.get(k) for k in PROGRAM_IDENTITY_KEYS + PROGRAM_DRIFT_KEYS}
+    fp["read_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    return fp
+
+
+def fingerprint_differences(recorded: dict, live: dict) -> list[str]:
+    """The identity fields on which the served program disagrees with a recorded one.
+
+    Returns display lines, because a refusal that says only "mismatch" sends the operator
+    hunting for which of six fields moved.
+    """
+    out = []
+    for k in PROGRAM_IDENTITY_KEYS:
+        was, now = recorded.get(k), live.get(k)
+        if was != now:
+            out.append(f"    {k}: recorded {was!r}  server {now!r}")
+    return out
+
+
+def verify_served_program(args, recorded: dict | None, source: str,
+                          unstamped_is_fatal: bool, refusal: str) -> dict:
+    """Refuse to continue against a program that is not the one `recorded` describes.
+
+    `source` names the file the recorded fingerprint came from and `refusal` is what going on
+    regardless would actually do wrong, both spelled by the caller: a refusal that says only
+    "mismatch" leaves the operator to work out which phase was about to damage what.
+
+    `unstamped_is_fatal` says whether a MISSING fingerprint is itself a refusal. It is for
+    `apply`, which writes to a database that took hours to build (and the message below is
+    written for that caller). It is not for `probe`, which writes only to a cache you can
+    delete -- refusing there would cost a ~150-minute re-probe to protect nothing.
+
+    Returns the live fingerprint, so callers can record what they actually saw.
+    """
+    live = read_program_fingerprint(args.url)
+    label = (f"{live.get('program_name')}  (base {live.get('base_address')}, "
+             f"{live.get('function_count')} functions)")
+
+    if recorded is None:
+        print(f"program: {label}")
+        print(f"  {source} carries no fingerprint of the program it was built from, so there is")
+        print("  nothing to compare and no way to tell whether its addresses index THIS program.")
+        if unstamped_is_fatal:
+            if not args.ignore_program_mismatch:
+                raise SystemExit(
+                    "  Refusing. Re-run `fetch` then `report` to stamp it -- ~20 s, and it\n"
+                    "  rebuilds only functions.json, types.json and plan.json; the probe cache\n"
+                    "  (arity.json, the ~150-minute one) is not touched. Or pass\n"
+                    "  --ignore-program-mismatch to apply it unchecked.")
+            print("  --ignore-program-mismatch given; continuing unchecked.")
+        else:
+            print("  Continuing: this phase writes only to the cache, never to the database.")
+        return live
+
+    diffs = fingerprint_differences(recorded, live)
+    if diffs:
+        print(f"program: {label}")
+        print(f"  This is NOT the program {source} was built from:")
+        for d in diffs:
+            print(d)
+        if not args.ignore_program_mismatch:
+            raise SystemExit(f"  Refusing: {refusal}\n"
+                             f"  Pass --ignore-program-mismatch if you know better.")
+        print("  --ignore-program-mismatch given; continuing anyway.")
+        return live
+
+    print(f"program: {label} -- matches {source}, stamped {recorded.get('read_at', 'unknown')}")
+    drift = [f"{k} {recorded.get(k)} -> {live.get(k)}"
+             for k in PROGRAM_DRIFT_KEYS if recorded.get(k) != live.get(k)]
+    if drift:
+        print(f"  it has been analysed further since ({', '.join(drift)}). Not a refusal: adding")
+        print("  functions or symbols does not move an address the plan already holds.")
+    return live
 
 
 # ---------------------------------------------------------------- C++ name parsing
@@ -343,8 +471,67 @@ def cache_path(args, name: str) -> str:
     return os.path.join(args.cache_dir, name)
 
 
+def read_cached_fingerprint(args) -> dict | None:
+    """The program `fetch` recorded for this cache directory, or None if it never did.
+
+    None means "unstamped", which is a different claim from "matches" and is reported as such
+    everywhere it is used -- a cache built before this script recorded a program cannot be
+    quietly assumed to be a cache of the right one.
+    """
+    p = cache_path(args, "program.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as fh:
+            fp = json.load(fh)
+    except ValueError as exc:
+        print(f"  note: {p} will not parse ({exc}); treating this cache as unstamped.")
+        return None
+    return fp if isinstance(fp, dict) else None
+
+
+def load_plan(args) -> tuple[list, dict | None]:
+    """Read plan.json, tolerating the pre-fingerprint shape.
+
+    `report` used to write a bare JSON LIST of rows and now writes
+    {"program": <fingerprint>, "generated": ..., "rows": [...]}, so the plan carries the
+    program it was built from. A list on disk is therefore an OLD plan: it is read normally,
+    and its missing fingerprint is reported as MISSING rather than being read as "nothing
+    differs" -- an unverifiable plan and a verified one must not look alike.
+    """
+    with open(cache_path(args, "plan.json"), encoding="utf-8") as fh:
+        doc = json.load(fh)
+    if isinstance(doc, list):
+        return doc, None
+    return doc.get("rows", []), doc.get("program")
+
+
 def phase_fetch(args) -> None:
     os.makedirs(args.cache_dir, exist_ok=True)
+
+    # Stamp the cache with the program it is a cache OF, before anything is pulled into it.
+    # Refuse to re-fetch over another program's cache: functions.json and types.json would be
+    # overwritten while arity.json (the ~150-minute probe cache) and plan.json stayed keyed to
+    # the OLD program's addresses, and `report` would then tier one program's functions using
+    # another program's decompiled arities without a word.
+    previous = read_cached_fingerprint(args)
+    fp = read_program_fingerprint(args.url)
+    if previous is not None:
+        diffs = fingerprint_differences(previous, fp)
+        if diffs and not args.ignore_program_mismatch:
+            raise SystemExit(
+                f"ERROR: {args.cache_dir} was fetched from a different program:\n"
+                + "\n".join(diffs) + "\n"
+                "       Fetching here would leave the probe cache and any plan keyed to the\n"
+                "       old program's addresses. Use --cache-dir <dir> for this program, or\n"
+                "       --ignore-program-mismatch to overwrite this one.")
+        if diffs:
+            print("--ignore-program-mismatch given; overwriting a cache of a different program.")
+    with open(cache_path(args, "program.json"), "w", encoding="utf-8") as fh:
+        json.dump(fp, fh, indent=1)
+    print(f"program: {fp.get('program_name')}  (base {fp.get('base_address')}, "
+          f"{fp.get('function_count')} functions per /get_metadata)")
+
     print("fetching function list ...")
     funcs = json.loads(_get(f"{args.url}/list_functions", timeout=900))["functions"]
     with open(cache_path(args, "functions.json"), "w", encoding="utf-8") as fh:
@@ -400,6 +587,16 @@ def load_candidates(args):
 
 def phase_probe(args) -> None:
     """Learn this-ness by decompiling. Slow; resumable; safe to interrupt."""
+    # arity.json is keyed by ADDRESS and merged with whatever is already there, so probing
+    # against a different program than the one this cache was fetched from silently mixes two
+    # programs' decompiler arities into one file -- and `report` then decides this-ness, the
+    # one decision that shifts every parameter when it is wrong, from the wrong program's
+    # registers. Checked before the ~150-minute loop starts rather than after it.
+    verify_served_program(
+        args, read_cached_fingerprint(args), "program.json", unstamped_is_fatal=False,
+        refusal="this cache would be topped up with a different program's decompiled\n"
+                "  arities, keyed by address, and `report` would then decide this-ness from\n"
+                "  them. Use --cache-dir <dir> for this program, or re-run `fetch` here.")
     cands, _ = load_candidates(args)
     path = cache_path(args, "arity.json")
     known: dict[str, int] = {}
@@ -419,8 +616,7 @@ def phase_probe(args) -> None:
         plan_file = cache_path(args, "plan.json")
         if not os.path.exists(plan_file):
             raise SystemExit("--from-plan needs plan.json; run `report` first.")
-        with open(plan_file, encoding="utf-8") as fh:
-            wanted = {row["address"] for row in json.load(fh)}
+        wanted = {row["address"] for row in load_plan(args)[0]}
         todo = [c for c in todo if c["address"] in wanted]
         print(f"restricted to the {len(wanted):,} addresses already in the plan")
     if args.only_resolvable:
@@ -570,9 +766,15 @@ def phase_report(args) -> None:
             "this": reason, "prototype": proto,
         })
 
+    # The plan carries the program it was built from. `report` is deliberately offline -- it
+    # is the one phase that needs no server -- so it copies the fingerprint `fetch` recorded
+    # rather than asking again; an address in this plan came from that fetch, not from
+    # whatever happens to be loaded now.
+    fp = read_cached_fingerprint(args)
     out = cache_path(args, "plan.json")
     with open(out, "w", encoding="utf-8") as fh:
-        json.dump(plan, fh, indent=1)
+        json.dump({"program": fp, "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                   "rows": plan}, fh, indent=1)
 
     kinds = Counter()
     for c in cands:
@@ -593,6 +795,13 @@ def phase_report(args) -> None:
         print(f"    {n:6,}  {r}")
     print()
     print(f"plan written to {out}  ({len(plan):,} prototypes)")
+    if fp is None:
+        print("  NOTE: this cache carries no program fingerprint, so nothing binds the plan to")
+        print("        the program it was built from and `apply` will refuse it. Re-run `fetch`")
+        print("        then `report` to stamp it (~20 s; the probe cache is not touched).")
+    else:
+        print(f"  built from {fp.get('program_name')} (base {fp.get('base_address')}), "
+              f"fetched {fp.get('read_at', 'unknown')}")
     print()
     print("sample:")
     for row in plan[:12]:
@@ -600,33 +809,149 @@ def phase_report(args) -> None:
         print(f"       {row['prototype'][:120]}")
 
 
+# What a journal line says happened to ONE planned row. --retry-failed retries everything that
+# is not "applied", which is the only honest reading of the set: "applied" is the sole outcome
+# the server confirmed reached the database.
+#
+#   applied            /set_function_prototype answered status=success
+#   rejected-on-apply  it answered, and refused -- usually "Can't resolve datatype"
+#   invalid            /validate_function_prototype refused it; no write was attempted
+#   error-validate     the validate GET raised; nothing was attempted
+#   stale-row          the address no longer carries the function the prototype came from
+#   unknown            the apply POST raised, or answered something unreadable -- the write MAY
+#                      have landed. A POST that times out after Ghidra has already committed
+#                      the transaction is indistinguishable from one that never arrived, so it
+#                      is recorded as unknown rather than flattened into a failure. Retrying it
+#                      is safe: setting the same prototype twice is idempotent.
+OUTCOME_APPLIED = "applied"
+
+# More than this share of rows naming a different function is not per-row drift -- it is a plan
+# built against a different STATE of the same program, and applying the remainder would write a
+# mostly-wrong plan while reporting a tidy APPLIED count for the minority that happened to still
+# match. The number is a judgement, not a measurement: re-analysis moves a handful of functions,
+# while a re-import of names moves most of them. --ignore-program-mismatch overrides it.
+STALE_ROW_REFUSAL_FRACTION = 0.25
+
+
 def phase_apply(args) -> None:
-    with open(cache_path(args, "plan.json"), encoding="utf-8") as fh:
-        plan = json.load(fh)
+    plan, plan_fp = load_plan(args)
+
+    # WHICH PROGRAM, before a single POST -- see the section at the top of this file. A dry run
+    # is held to the same check on purpose: it exists to PREDICT what an apply would do to the
+    # served program, and a validation report about a different program is worse than none.
+    live_fp = verify_served_program(
+        args, plan_fp, "plan.json", unstamped_is_fatal=True,
+        refusal="every address in that plan indexes the program it was built from, so\n"
+                "  applying it here would write prototypes into whatever THIS program holds at\n"
+                "  those addresses -- and the server would report every one of them as applied.\n"
+                "  Re-run `fetch` and `report` against this program (~20 s).")
+
     if args.retry_failed:
-        # Re-run only what the journal shows did NOT apply. Uses the CURRENT plan, so a fix
+        # Re-run only what the journal RECORDS as not applied. Uses the CURRENT plan, so a fix
         # to type mapping or this-detection is picked up; re-applying a success would be
         # harmless but wastes ~250 ms each, and there are usually far more of those.
+        #
+        # This set is only ever as complete as the journal, which is why every outcome is
+        # written to it now. A prototype rejected at VALIDATION used to leave no line at all,
+        # so the very fix this flag exists to retry -- a type mapping that makes it valid --
+        # could never reach it: the retry run printed "retrying 0 that did not apply" and an
+        # all-zero summary over hundreds of functions that had never been written.
         jpath = cache_path(args, "journal.jsonl")
         if not os.path.exists(jpath):
             raise SystemExit("--retry-failed needs journal.jsonl; nothing has been applied yet.")
-        failed_addrs = set()
+        last: dict[str, str] = {}
+        pre_outcome = 0
         with open(jpath, encoding="utf-8") as fh:
             for line in fh:
                 try:
                     rec = json.loads(line)
                 except ValueError:
                     continue
-                if (rec.get("result") or {}).get("status") != "success":
-                    failed_addrs.add(rec["address"])
-                else:
-                    failed_addrs.discard(rec["address"])   # a later success supersedes
-        plan = [p for p in plan if p["address"] in failed_addrs]
-        print(f"retrying {len(plan):,} that did not apply")
+                addr = rec.get("address")
+                if not addr:
+                    continue                           # a run header, not a row
+                outcome = rec.get("outcome")
+                if outcome is None:
+                    # A line from a journal written before outcomes were recorded. Its
+                    # result.status still says whether it applied, so it is read rather than
+                    # discarded -- but a journal of that vintage is SILENT about rows that
+                    # failed validation or errored, and that silence is indistinguishable from
+                    # "never attempted". Counted here and reported below rather than papered
+                    # over, because it changes what this retry set can possibly contain.
+                    pre_outcome += 1
+                    outcome = (OUTCOME_APPLIED
+                               if (rec.get("result") or {}).get("status") == "success"
+                               else "rejected-on-apply")
+                last[addr] = outcome                   # a later line supersedes an earlier one
+        not_applied = {a: o for a, o in last.items() if o != OUTCOME_APPLIED}
+        planned = {p["address"] for p in plan}
+        plan = [p for p in plan if p["address"] in not_applied]
+        print(f"retrying {len(plan):,} that the journal records as not applied")
+        for outcome, n in Counter(not_applied[p["address"]] for p in plan).most_common():
+            print(f"    {n:6,}  {outcome}")
+        unseen = len(planned - set(last))
+        if unseen:
+            print(f"  note: {unseen:,} plan rows appear in NO journal line -- never attempted:")
+            print("        an interrupted run, or an earlier --tier/--limit. --retry-failed does")
+            print("        not pick those up; a plain `apply --apply` run does.")
+        dropped = len(set(not_applied) - planned)
+        if dropped:
+            print(f"  note: {dropped:,} more are recorded as not applied but are no longer in the")
+            print("        plan -- a later `report` moved them to Tier 3, say. Not retried here.")
+        if pre_outcome:
+            print(f"  note: {pre_outcome:,} journal lines predate per-outcome recording. Applied")
+            print("        vs not-applied still reads out of them, but rows that failed VALIDATION")
+            print("        were not journalled at all then, so they land in the 'never attempted'")
+            print("        count above instead of in this retry set. A plain run sweeps them up.")
     if args.tier:
         plan = [p for p in plan if p["tier"] == args.tier]
     if args.limit:
         plan = plan[: args.limit]
+
+    # ROW-LEVEL binding. The fingerprint above catches "a different program is loaded"; it
+    # cannot catch the RIGHT program re-analysed since the plan was built, where a function was
+    # renamed, deleted, or its entry point moved. /set_function_prototype takes an address, so
+    # that row would be written over whatever now sits there and reported as applied.
+    #
+    # /validate_function_prototype cannot answer this -- it returns {"valid":...} and an error
+    # string, never the function's name. /get_function_by_address can, but costs an extra round
+    # trip per row: ~13,100 of them, doubling a ~50 ms/function run. One /list_functions (the
+    # same unpaginated call `fetch` makes, ~20 s for 216,891 functions) answers it for every row
+    # at once, so that is what this does.
+    current_names: dict[str, str] = {}
+    row_check = True
+    try:
+        listed = json.loads(_get(f"{args.url}/list_functions", timeout=900))["functions"]
+        current_names = {f["address"]: f.get("name", "") for f in listed}
+    except Exception as exc:                           # noqa: BLE001 - report and carry on
+        row_check = False
+        print(f"WARNING: /list_functions did not answer ({exc}), so NO row was checked against")
+        print("         the function its prototype was derived from. The program-level")
+        print("         fingerprint above did match, so this run is still bound to the right")
+        print("         program -- but a function renamed or removed since the plan was built")
+        print("         will be written at its old address without notice.")
+
+    stale: dict[str, tuple[str, str | None]] = {}
+    if row_check:
+        for row in plan:
+            now = current_names.get(row["address"])
+            if now != row["name"]:
+                stale[row["address"]] = (row["name"], now)
+        print(f"rows   : {len(plan) - len(stale):,} of {len(plan):,} still carry the function "
+              f"their prototype was derived from")
+        for addr, (was, now) in list(stale.items())[:5]:
+            print(f"    {addr}  plan: {was[:70]}")
+            print(f"    {' ' * len(addr)}   now: "
+                  f"{'<no function at that address>' if now is None else now[:70]}")
+        if stale and len(stale) > len(plan) * STALE_ROW_REFUSAL_FRACTION \
+                and not args.ignore_program_mismatch:
+            raise SystemExit(
+                f"  Refusing: {len(stale):,} of {len(plan):,} rows name a function that is no\n"
+                f"  longer at that address. That is not drift, it is a plan built against a\n"
+                f"  different state of this program -- re-run `fetch` and `report` (~20 s) to\n"
+                f"  rebuild it, or pass --ignore-program-mismatch to apply the rest anyway.")
+        if stale:
+            print(f"    {len(stale):,} will be SKIPPED and journalled as stale-row, not applied.")
 
     if not args.apply:
         print(f"DRY RUN over {len(plan):,} prototypes -- validating only, nothing is written.")
@@ -634,12 +959,58 @@ def phase_apply(args) -> None:
         print(f"APPLYING {len(plan):,} prototypes. Journal: {cache_path(args, 'journal.jsonl')}")
 
     ok = bad = failed = 0
-    applied = rejected_on_apply = 0
+    applied = rejected_on_apply = unknown = skipped_stale = 0
     apply_errors: Counter = Counter()
     jpath = cache_path(args, "journal.jsonl")
     journal = open(jpath, "a", encoding="utf-8") if args.apply else None
+
+    # EVERY OUTCOME GOES THROUGH HERE. The journal used to be written only after the apply POST
+    # returned and its body parsed, so three of the six ways a row can end -- a validate GET
+    # that raised, a prototype the validator rejected, an apply POST that raised or answered
+    # unreadably -- left no line at all. A record that is the ONLY record of what happened has
+    # to record what happened; --retry-failed reads nothing else.
+    #
+    # The shape stays readable both ways. An old reader looks at result.status: "applied" lines
+    # carry the server's success payload and read as applied, and every other outcome either
+    # carries a payload without a status (the validator's {"valid":false}) or none at all, so it
+    # reads as not-applied -- which is what it is. Nothing here needs the old journals rewritten.
+    #
+    # Server answers go in "result", things this script observed go in "detail", so a line never
+    # implies the server said something it did not.
+    def record(row: dict, outcome: str, result=None, detail=None) -> None:
+        if journal is None:
+            return
+        line = {**row, "outcome": outcome}
+        if result is not None:
+            line["result"] = result
+        if detail is not None:
+            line["detail"] = detail
+        journal.write(json.dumps(line) + "\n")
+        # Flush every line. The journal is the ONLY record of what was written to the database,
+        # so buffering it means a crash loses exactly the information needed to know how far
+        # the run got -- which is the one job it has. Observed: default buffering held ~280
+        # entries back.
+        journal.flush()
+        os.fsync(journal.fileno())
+
     try:
+        if journal:
+            # One header line per run: the rows after it were written to THIS program, at this
+            # moment, with the row check either on or off. Readers skip any line without an
+            # "address" (the retry loader above does), so journals that only ever held rows
+            # still read exactly as before.
+            journal.write(json.dumps({
+                "event": "apply_run", "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "program": live_fp, "rows": len(plan), "row_name_check": row_check,
+                "ignore_program_mismatch": bool(args.ignore_program_mismatch),
+            }) + "\n")
+            journal.flush()
         for i, row in enumerate(plan):
+            if row["address"] in stale:
+                skipped_stale += 1
+                was, now = stale[row["address"]]
+                record(row, "stale-row", detail={"planned_name": was, "current_name": now})
+                continue
             q = urllib.parse.urlencode({
                 "function_address": "0x" + row["address"],
                 "prototype": row["prototype"],
@@ -649,11 +1020,15 @@ def phase_apply(args) -> None:
                 v = json.loads(_get(f"{args.url}/validate_function_prototype?{q}", timeout=120))
             except Exception as exc:                   # noqa: BLE001
                 failed += 1
+                record(row, "error-validate", detail={"error": f"{type(exc).__name__}: {exc}"})
                 continue
             if not v.get("valid"):
                 bad += 1
                 if bad <= 8:
                     print(f"  INVALID {row['name'][:60]}\n          {row['prototype'][:110]}\n          {v}")
+                # Journalled even though nothing was written: this row did not apply, and
+                # --retry-failed exists precisely to re-validate it after the type-mapping fix.
+                record(row, "invalid", result=v)
                 continue
             ok += 1
             if args.apply:
@@ -663,32 +1038,40 @@ def phase_apply(args) -> None:
                         "prototype": row["prototype"],
                         "calling_convention": args.calling_convention,
                     }, timeout=120)
-                    parsed_res = json.loads(res)
-                    # VALIDATION IS NOT A PREDICTION OF APPLICATION. They take different
-                    # resolution paths: /validate_function_prototype answered {"valid":true}
-                    # for 2,027 prototypes that /set_function_prototype then rejected with
-                    # "Can't resolve datatype". Counting only validation reported a clean run
-                    # while 15.5% of the writes had silently failed -- so the APPLY result is
-                    # what gets counted here.
-                    if parsed_res.get("status") == "success":
-                        applied += 1
-                    else:
-                        rejected_on_apply += 1
-                        reason = str(parsed_res.get("error", "unknown"))
-                        apply_errors[re.sub(r".*resolve (?:return type|datatype): ", "", reason)[:60]] += 1
-                        if rejected_on_apply <= 5:
-                            print(f"  APPLY FAILED {row['name'][:56]}\n          {reason[:120]}")
-                    journal.write(json.dumps({**row, "result": parsed_res}) + "\n")
-                    # Flush every line. The journal is the ONLY record of what was written
-                    # to the database, so buffering it means a crash loses exactly the
-                    # information needed to know how far the run got -- which is the one
-                    # job it has. Observed: default buffering held ~280 entries back.
-                    journal.flush()
-                    os.fsync(journal.fileno())
                 except Exception as exc:               # noqa: BLE001
-                    failed += 1
+                    # UNKNOWN, not failed. The POST may have been applied and the answer lost.
+                    unknown += 1
+                    record(row, "unknown", detail={"error": f"{type(exc).__name__}: {exc}"})
+                    continue
+                try:
+                    parsed_res = json.loads(res)
+                    if not isinstance(parsed_res, dict):
+                        raise ValueError("answer is not a JSON object")
+                except ValueError as exc:
+                    unknown += 1
+                    record(row, "unknown",
+                           detail={"error": f"unreadable answer ({exc})", "body": res[:200]})
+                    continue
+                # VALIDATION IS NOT A PREDICTION OF APPLICATION. They take different
+                # resolution paths: /validate_function_prototype answered {"valid":true}
+                # for 2,027 prototypes that /set_function_prototype then rejected with
+                # "Can't resolve datatype". Counting only validation reported a clean run
+                # while 15.5% of the writes had silently failed -- so the APPLY result is
+                # what gets counted here.
+                if parsed_res.get("status") == "success":
+                    applied += 1
+                    record(row, OUTCOME_APPLIED, result=parsed_res)
+                else:
+                    rejected_on_apply += 1
+                    reason = str(parsed_res.get("error", "unknown"))
+                    apply_errors[re.sub(r".*resolve (?:return type|datatype): ", "", reason)[:60]] += 1
+                    if rejected_on_apply <= 5:
+                        print(f"  APPLY FAILED {row['name'][:56]}\n          {reason[:120]}")
+                    record(row, "rejected-on-apply", result=parsed_res)
             if (i + 1) % 250 == 0:
                 extra = f" APPLIED={applied:,} apply-failed={rejected_on_apply:,}" if args.apply else ""
+                if unknown:
+                    extra += f" unknown={unknown:,}"
                 print(f"  {i + 1:,}/{len(plan):,}  valid={ok:,} invalid={bad:,} errors={failed:,}{extra}",
                       flush=True)
     finally:
@@ -696,21 +1079,40 @@ def phase_apply(args) -> None:
             journal.close()
 
     print()
+    if skipped_stale:
+        print(f"skipped stale: {skipped_stale:,}  (the address no longer carries that function)")
     print(f"validated OK : {ok:,}")
     print(f"rejected     : {bad:,}")
     print(f"errors       : {failed:,}")
     if args.apply:
         print(f"APPLIED      : {applied:,}")
         print(f"apply-failed : {rejected_on_apply:,}")
+        print(f"unknown      : {unknown:,}")
         for reason, n in apply_errors.most_common(10):
             print(f"    {n:6,}  {reason}")
         if rejected_on_apply:
             print("\nThose functions were NOT changed. Their prototypes validated but could not")
             print("be applied -- the two use different type-resolution paths.")
+        if unknown:
+            print("\nThe unknown ones may or may not have been written: their POST raised or came")
+            print("back unreadable, and a request that times out after Ghidra committed the")
+            print("transaction looks exactly like one that never arrived. --retry-failed re-applies")
+            print("them, which is harmless -- setting the same prototype twice changes nothing.")
     else:
         print("\nNothing was written. Re-run with --apply to commit.")
         print("NOTE: validating is not the same as applying. Some prototypes that validate")
         print("      are still rejected on apply; only --apply reports that.")
+
+    # Every row of this run ended in exactly one of those buckets. If the arithmetic does not
+    # close, this script's own bookkeeping is wrong and none of the numbers above can be relied
+    # on -- which is the failure that put 2,027 silent write failures behind a clean summary in
+    # the first place, so it is asserted rather than assumed.
+    accounted = (applied + rejected_on_apply + unknown if args.apply else ok) \
+        + bad + failed + skipped_stale
+    if accounted != len(plan):
+        print(f"\nWARNING: {len(plan):,} rows went through this run but {accounted:,} are")
+        print("         accounted for above. The counters do not add up, which is a bug in this")
+        print("         script's bookkeeping, not a fact about the program.")
 
 
 def main() -> int:
@@ -735,6 +1137,20 @@ def main() -> int:
     ap.add_argument("--apply", action="store_true", help="actually write (default is a dry run)")
     ap.add_argument("--retry-failed", action="store_true",
                     help="apply only the entries the journal shows did not apply")
+    ap.add_argument("--ignore-program-mismatch", action="store_true",
+                    help="proceed even though the served program is not the one the cache or "
+                         "plan was built from. Overrides the four REFUSALS -- fetching over "
+                         "another program's cache, probing against one, applying a plan whose "
+                         "fingerprint differs or is missing, and applying one where most rows "
+                         "name a function that has moved. For the operator who knows the "
+                         "difference is harmless: a long job refusing with no way past it is "
+                         "its own failure mode. It does NOT force an individual stale row: a "
+                         "row whose address no longer carries the function its prototype was "
+                         "derived from is skipped either way, because writing that prototype "
+                         "over whatever is there now is the corruption, not the mismatch. "
+                         "Re-run `fetch` and `report` (~20 s) to rebuild those rows against "
+                         "the current names. The mismatch is still printed, and still "
+                         "journalled on the run header.")
     args = ap.parse_args()
 
     os.makedirs(args.cache_dir, exist_ok=True)
