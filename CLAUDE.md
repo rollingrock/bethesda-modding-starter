@@ -38,6 +38,13 @@ right after install, restart the shell before debugging anything else.
 Known trap this phase exists for: `VCPKG_ROOT` **and** `VCPKG_INSTALLATION_ROOT` must both be
 set (different files in the build chain read different names).
 
+What this phase delivers is *both env vars pointing at one healthy vcpkg* — not a vcpkg at
+`C:eposcpkg` specifically. If this machine already has a bootstrapped clone and
+`VCPKG_ROOT` names it, `10-vcpkg.ps1` adopts that root in place and says so, rather than
+cloning a second copy and repointing a machine-wide variable other projects resolve through.
+Pass `-VcpkgDir` only when you actually want a particular location; an explicit one always
+wins over adoption.
+
 ## Phase 2 — repos
 
 ```powershell
@@ -215,6 +222,15 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
 loaded program; then an MCP session can `decompile_function` and see **real names** rather
 than `FUN_*`. **Read `docs/GHIDRA_WORKFLOW.md` before real RE work.**
 
+**`-Stop` exiting 1 is a refusal, not a flake — do not retry-loop it.** It declines in exactly
+two cases, and both mean stopping would destroy something: `/save_all_programs` failed, so
+every rename and retype made through the MCP tools since the last save is still only in the
+JVM; or something is serving the port but no PID record proves this checkout started it. Read
+which one it printed. The first is usually a busy server — wait for the long decompile or
+analysis to finish and run `-Stop` again. Re-run with `-Force` only when you accept the stated
+cost (lost edits, or a stale project `.lock` the next run has to clear). `-Force` with no PID
+record still only asks over HTTP; it never kills a process it cannot identify.
+
 Measured end to end on F4VR (2026-08-16), so you know what "done" looks like:
 
 | | |
@@ -346,3 +362,12 @@ All PASS (vr_address_tools may be an intentional skip) = the machine is at parit
   silently coerced (see `docs/DEVBENCH.md` for why this rule exists).
 - Prefer building against the pinned/vendored versions in this pack; upgrade deliberately,
   one component at a time, with the verifier run after.
+- **Never destroy what you cannot prove you created.** Before any `Remove-Item -Recurse`,
+  `Stop-Process`, or `Move-Item -Force` against something a user could own, the script must hold
+  local evidence that the pack made it: a pre-existence flag captured before the operation, an
+  identity-carrying record (pid *and* process name *and* start time, not a bare pid), or a
+  successful save. Absent that evidence the correct action is to leave it alone and say so —
+  a directory deleted, a process killed, or hours of unsaved database edits lost are not
+  recoverable by re-running the script, and every one of these was a real defect here, not a
+  hypothetical. The same rule applies in the restore direction: never `-Force` a file back over
+  one that reappeared while it was held.
