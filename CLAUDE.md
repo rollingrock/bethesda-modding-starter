@@ -359,7 +359,23 @@ Verified live on FO4VR 1.2.72 (2026-08-16): all 7 tools answer; `rendertarget li
 .\setup\90-verify.ps1 -BuildTest
 ```
 
-All PASS (vr_address_tools may be an intentional skip) = the machine is at parity.
+No `FAIL` row = the machine is at parity. `FAIL` is the only state that gates the exit code;
+the other four are information, not alarm:
+
+| | |
+|---|---|
+| `PASS` | checked, and it held |
+| `FAIL` | checked, and it did not — the only state that exits 1 |
+| `skip` | does not apply to *this* machine on purpose (`-SkipAddressTools`, `-HeadlessOnly`, an analysis nobody has spent the hours on yet) |
+| `pending` | work is outstanding but nothing is broken — the exit-2 answer the `-CheckOnly` gates give |
+| `idle` | an optional service simply is not running right now |
+
+Read `Detail` before acting on any row: it carries what was actually observed — which `python`
+was found, which JVM `gradlew` will use, which jar is missing — not a restatement of the check.
+
+`-Json` emits the same rows as a JSON array, which is what an agent should consume; a
+`Format-Table` render moves its column boundaries with the terminal width. `-Fast` drops the
+delegated `-CheckOnly` gate rows, the only ones that spawn a process.
 
 ## Standing rules for work in this environment
 
