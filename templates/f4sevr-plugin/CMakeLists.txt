@@ -45,13 +45,18 @@ set(CommonLibName "CommonLibF4")
 set(F4SE_SUPPORT_XBYAK ON CACHE BOOL "" FORCE)   # PCH.h includes xbyak; the lib gates it
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)         # do not build CommonLibF4's Catch2 suite
 
+# FalloutPathVariable carries the LITERAL name of the variable the user has to set, because
+# FalloutPath itself is unset in exactly the case the COPY_BUILD check below has to report, and a
+# diagnostic that interpolates an unset variable names nothing (see that check).
 if(BUILD_FALLOUTVR)
 	set_from_environment(FalloutVRPath)
 	set(FalloutPath ${FalloutVRPath})
+	set(FalloutPathVariable "FalloutVRPath")
 	set(FalloutVersion "Fallout VR")
 else()
 	set_from_environment(Fallout4Path)
 	set(FalloutPath ${Fallout4Path})
+	set(FalloutPathVariable "Fallout4Path")
 	set(FalloutVersion "Fallout 4")
 endif()
 
@@ -263,7 +268,19 @@ endif()
 
 # ---- Post build ----
 if(COPY_BUILD)
-	if(DEFINED FalloutPath)
+	# COPY_BUILD defaults OFF, so reaching here means a deploy was asked for explicitly -- a user
+	# preset inheriting the hidden `copy-build`, or -DCOPY_BUILD=ON -- and a deploy with nowhere to
+	# deploy TO is a request that cannot be met, so fail at configure exactly like the MO2 arm
+	# below. This used to be message(WARNING "Variable ${FalloutPath} is not defined..."), which
+	# interpolated the one variable this branch has just proved undefined and therefore printed
+	# "Variable  is not defined." -- a single blank-named warning, scrolled past in vcpkg's
+	# configure output, naming nothing the user could act on. Worse, no POST_BUILD command is added
+	# at all, so every later `cmake --build` exits 0 having copied nothing and never mentions the
+	# deploy again: export Fallout4VRPath instead of FalloutVRPath and you get an unbounded run of
+	# green builds the game never sees. The set-but-WRONG-path case was always loud -- `cmake -E
+	# copy` into a missing Data/F4SE/Plugins returns 1 and fails the build -- so the unset case was
+	# the only quiet one, and it is the one a user hits first.
+	if(DEFINED FalloutPath AND NOT "${FalloutPath}" STREQUAL "")
 		string(REGEX REPLACE "[/\\][Dd][Aa][Tt][Aa][/\\]?$" "" FalloutPath "${FalloutPath}") # remove " /data " if exists; cmake regex doesn't have /i
 		add_custom_command(
 			TARGET ${PROJECT_NAME}
@@ -273,8 +290,14 @@ if(COPY_BUILD)
 		)
 	else()
 		message(
-			WARNING
-			"Variable ${FalloutPath} is not defined. Skipping post-build copy command."
+			FATAL_ERROR
+			"COPY_BUILD is ON, but ${FalloutPathVariable} is not set, so there is no ${FalloutVersion} "
+			"install to copy the plugin into and this build would deploy nothing while reporting "
+			"success. Set the ${FalloutPathVariable} environment variable -- or pass "
+			"-D${FalloutPathVariable}=<path> -- to the folder that CONTAINS ${FalloutVersion}'s Data "
+			"directory; the vr-copy preset in CMakeUserPresets.json.template shows the shape "
+			"(\"C:/Steam/steamapps/common/Fallout 4 VR\"). Deploying into an MO2 mod folder instead is "
+			"MO2_INSTALL_PATH; if you did not want a deploy at all, configure with -DCOPY_BUILD=OFF."
 		)
 	endif()
 endif()

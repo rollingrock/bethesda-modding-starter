@@ -20,13 +20,103 @@ jobs:
         shell: powershell
         run: $PSVersionTable.PSVersion.ToString()
 
-      - name: Every .ps1 must parse under 5.1
+      # Two AST lints ride along with the parse instead of getting a step each, because this is
+      # already the only place that reads every .ps1 -- a second walker would drift out of step
+      # with this one about which files it even covers. Both target a class this repo has
+      # regrown AFTER being fixed once, with two or more confirmed instances each; that, not
+      # general strictness, is what makes a query worth running on every push.
+      #
+      # LINT A -- the return-bypass class. A `return` with no enclosing function leaves the
+      # SCRIPT, skipping the explicit `exit` the step below insists on. 10-vcpkg.ps1 shipped
+      # exactly that: its -NoEnv branch returned, so a fully successful run reported whatever
+      # the last native command had left in $LASTEXITCODE -- measured 128 on a tag-pinned
+      # clone, which every caller gating on that value reads as a hard failure. A `return`
+      # inside a ForEach-Object/Where-Object block is a different statement (it ends that
+      # iteration, not the script) and is deliberately NOT flagged: 30-ghidra.ps1's
+      # busy-JVM filter is built on it. Files starting with _ are dot-sourced and have no
+      # exit contract, so they are exempt.
+      #
+      # LINT B -- the naked file write class. With no -Encoding, none of these four writes UTF-8,
+      # and none writes the same bytes on 5.1 as on pwsh 7. Get-Content, Set-Content and
+      # Add-Content use the machine's ANSI codepage; Out-File uses UTF-16LE with a BOM -- measured
+      # on 5.1, `Out-File` gives FF FE 61 00 where `Set-Content` gives 61 62 63 -- so it is a
+      # different wrong answer, not the same one, and naming only ANSI here would leave the next
+      # maintainer thinking Out-File was covered by accident.
+      # On cp1252 the ANSI round-trip is byte-preserving and hides; on a DBCS locale it corrupts, which is how
+      # New-Plugin.ps1 produced a CMakeUserPresets.json that cmake 3.31.6 accepted with rc=0
+      # while creating a deploy directory with U+FFFD in its name. A hosted runner cannot
+      # change its system codepage, so that corruption can never be REPRODUCED in CI -- an AST
+      # query is the only form in which this class is catchable here at all. -Encoding ascii is
+      # a real answer and stays one (36-ghidra-mcp.ps1 writes its PID record that way on
+      # purpose); -Encoding Default and -Encoding OEM are the ANSI codepage with a parameter in
+      # front of it, and are refused.
+      - name: Every .ps1 must parse under 5.1, then the two AST recurrence lints
         shell: powershell
         run: |
           $failed = @()
+          $lintFail = @()
+
+          # The three allowlists below are per FILE and per COUNT, and they are CEILINGS, not
+          # blessings: a new occurrence -- in a listed file above its number, or in any file
+          # not listed at all -- fails this step. Every entry names a defect that predates the
+          # lint so it can be closed, and none of them is an exemption anyone argued for.
+          # Counts measured on this tree 2026-08-22. Falling BELOW a number only prints
+          # TIGHTEN and never fails, so landing a repair cannot turn CI red on the person who
+          # landed it; the entry is meant to come down in that same change. An entry naming a
+          # file that is not in the tree DOES fail, because an allowlist nobody can audit
+          # against a real file is how one starts growing quietly.
+          $knownBareReturn = @{
+              # The SkyrimNG branch prints "use your existing template" and returns, so the one
+              # outcome that is normal and expected is also the only one that never reaches the
+              # `exit 0` at the bottom -- the 10-vcpkg.ps1 bug verbatim, in a second file.
+              'New-Plugin.ps1' = 1
+          }
+          # Empty, and that is the shipped state, not an oversight: no .ps1 in this tree writes a
+          # file through these cmdlets without an encoding any more. The four that did -- the
+          # scaffold token rewrite, the vcpkg manifest rewrite and CMakeUserPresets.json in
+          # New-Plugin.ps1 -- were repaired in the same batch as this lint, so the write half is
+          # enforcing at zero everywhere. Anything landing in here later has to arrive with a
+          # reason next to it, in a diff, which is the only way an allowlist stays honest.
+          $bareWriteAllowed = @{}
+          # Reads are grandfathered, writes are not, because the two fail differently: a bad read
+          # produces a wrong value in one process, a bad write leaves wrong bytes on disk for
+          # everything that opens the file afterwards. All 19 below are Get-Content, and each
+          # reads either an ASCII file or JSON this pack wrote itself with a BOM 5.1 detects --
+          # which is why they have not bitten yet, not a reason they cannot.
+          $bareReadAllowed = @{
+              'setup\30-ghidra.ps1'          = 1   # Ghidra's own application.properties, ASCII in practice
+              'setup\35-ghidra-analysis.ps1' = 2   # tailing the headless run/import logs
+              'setup\36-ghidra-mcp.ps1'      = 10  # 5 manifest/PID/lock reads + 5 log tails
+              'setup\90-verify.ps1'          = 3   # JSON this pack wrote itself, so BOM-detected
+              'setup\_common.ps1'            = 3   # same
+          }
+          # Encodings that name a fixed byte mapping, so the result does not depend on which
+          # codepage the machine happens to be set to. Default/OEM/String/Unknown are missing on
+          # purpose: those ARE the ANSI/OEM codepage. utf8BOM and utf8NoBOM are missing because
+          # they are pwsh 7 spellings that throw under 5.1, which is this file's whole subject.
+          $okEncoding = @('ascii', 'bigendianunicode', 'byte', 'unicode', 'utf32', 'utf7', 'utf8')
+          # Aliases included: gc/cat/type/sc/ac reach the same cmdlets and the same default.
+          $ioCmds = @('get-content', 'set-content', 'out-file', 'add-content', 'gc', 'cat', 'type', 'sc', 'ac')
+          $writeCmds = @('set-content', 'out-file', 'add-content', 'sc', 'ac')
+
+          $seenReturn = @{}; $seenWrite = @{}; $seenRead = @{}
+          $isReturn = { param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] }
+          $isCommand = { param($n) $n -is [System.Management.Automation.Language.CommandAst] }
+
+          $lintRoot = (Get-Location).Path
           Get-ChildItem -Path . -Filter *.ps1 -Recurse -File | ForEach-Object {
+              # Key on the REPO-RELATIVE PATH, not the leaf. Two .ps1 with the same file name in
+              # different directories otherwise share one bucket and the last one enumerated
+              # silently overwrites the first -- Get-ChildItem -Recurse walks root-level
+              # directories alphabetically, so anything sorting before setup\ is erased. Measured:
+              # an aaa\90-verify.ps1 carrying two naked Set-Content calls made this step PRINT
+              # both of them and then declare itself clean, exit 0. A check that reports a defect
+              # and passes anyway is the exact shape this review exists to remove, and it matters
+              # here because the repo ships a templates\ tree meant to be copied.
+              $name = $_.FullName.Substring($lintRoot.Length).TrimStart('\', '/')
+              $leaf = $_.Name
               $errs = $null
-              $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              $ast = [System.Management.Automation.Language.Parser]::ParseFile(
                   $_.FullName, [ref]$null, [ref]$errs)
               if ($errs.Count) {
                   $failed += $_.FullName
@@ -34,9 +124,78 @@ jobs:
                   $errs | Select-Object -First 5 | ForEach-Object {
                       Write-Host "    line $($_.Extent.StartLineNumber): $($_.Message)"
                   }
+                  # A file that did not parse has no usable AST, so it contributes no lint
+                  # counts -- which is why the parse verdict is returned before them below.
+                  return
               }
-              else { Write-Host "ok   $($_.Name)" }
+              Write-Host "ok   $name"
+
+              # The dot-sourced-library exemption is about the FILE NAME, so it uses the leaf --
+              # $name is now a path and would never match '_*' for anything under a directory.
+              if ($leaf -notlike '_*') {
+                  $n = 0
+                  foreach ($r in $ast.FindAll($isReturn, $true)) {
+                      # Walk out to the root. The FIRST scope-forming ancestor decides it: a
+                      # function or a script block passed to a cmdlet both catch the return,
+                      # while if/else/try bodies do not and let it leave the script.
+                      $p = $r.Parent; $scoped = $false
+                      while ($p) {
+                          if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst] -or
+                              $p -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
+                              $scoped = $true; break
+                          }
+                          $p = $p.Parent
+                      }
+                      if ($scoped) { continue }
+                      $n++
+                      Write-Host "     return-bypass $($name):$($r.Extent.StartLineNumber)  $($r.Extent.Text.Trim())"
+                  }
+                  $seenReturn[$name] = $n
+              }
+
+              $w = 0; $rd = 0
+              foreach ($c in $ast.FindAll($isCommand, $true)) {
+                  $cn = $c.GetCommandName()
+                  if (-not $cn) { continue }
+                  # Strip a module qualifier before matching. GetCommandName() returns exactly
+                  # what was written, so `Microsoft.PowerShell.Management\Set-Content` compared
+                  # whole-string against the list matched nothing and escaped the lint entirely
+                  # (measured). Fully-qualified calls are rare but legal, and a lint with a
+                  # trivially-written bypass is worth less than no lint.
+                  $cn = ($cn -split '\\')[-1].ToLower()
+                  if ($ioCmds -notcontains $cn) { continue }
+                  $hasEnc = $false; $encArg = ''
+                  for ($i = 1; $i -lt $c.CommandElements.Count; $i++) {
+                      $e = $c.CommandElements[$i]
+                      if ($e -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
+                      # Match how PowerShell binds it, not how it is spelled: -Enc is the same
+                      # parameter as -Encoding, and a lint that only knew the long form would
+                      # bless the short one.
+                      $pn = $e.ParameterName
+                      if ($pn.Length -lt 3) { continue }
+                      if (-not 'Encoding'.StartsWith($pn, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                      $hasEnc = $true
+                      if ($e.Argument) { $encArg = $e.Argument.Extent.Text }
+                      elseif (($i + 1) -lt $c.CommandElements.Count) { $encArg = $c.CommandElements[$i + 1].Extent.Text }
+                  }
+                  $ln = $c.Extent.StartLineNumber
+                  if ($hasEnc) {
+                      $v = $encArg.Trim().Trim("'", '"').ToLower()
+                      if ($okEncoding -notcontains $v) {
+                          # No allowlist for this one: it is always wrong, and it has never
+                          # appeared here, so grandfathering it would be inventing a debt.
+                          $lintFail += "bad-encoding $($name):$ln"
+                          Write-Host "     FAIL $($name):$ln  $cn -Encoding $encArg does not name a fixed byte mapping"
+                      }
+                      continue
+                  }
+                  if ($writeCmds -contains $cn) { $w++ } else { $rd++ }
+                  Write-Host "     no -Encoding $($name):$ln  $cn"
+              }
+              $seenWrite[$name] = $w
+              $seenRead[$name] = $rd
           }
+
           if ($failed.Count) {
               Write-Host ''
               Write-Host "$($failed.Count) script(s) do not parse under Windows PowerShell 5.1."
@@ -45,6 +204,47 @@ jobs:
               Write-Host 'CP1252 -- an em dash becomes U+201D, which PowerShell treats as a quote.'
               exit 1
           }
+
+          function Test-Budget($label, $seen, $allowed, [ref]$fail) {
+              foreach ($k in $seen.Keys) {
+                  $cap = 0
+                  if ($allowed.ContainsKey($k)) { $cap = $allowed[$k] }
+                  if ($seen[$k] -gt $cap) {
+                      $fail.Value += "$label $k"
+                      Write-Host "FAIL $label -- $k has $($seen[$k]), its allowlist entry permits $cap"
+                  }
+                  elseif ($seen[$k] -lt $cap) {
+                      Write-Host "TIGHTEN $label -- $k is down to $($seen[$k]); lower its allowlist entry to that, or drop it"
+                  }
+              }
+              foreach ($k in $allowed.Keys) {
+                  if (-not $seen.ContainsKey($k)) {
+                      $fail.Value += "$label allowlist entry $k"
+                      Write-Host "FAIL $label -- allowlist entry '$k' matches no .ps1 in the tree; delete it"
+                  }
+              }
+          }
+          Test-Budget 'return-bypass' $seenReturn $knownBareReturn ([ref]$lintFail)
+          Test-Budget 'bare write' $seenWrite $bareWriteAllowed ([ref]$lintFail)
+          Test-Budget 'bare read' $seenRead $bareReadAllowed ([ref]$lintFail)
+
+          if ($lintFail.Count) {
+              Write-Host ''
+              if (@($lintFail | Where-Object { $_ -like 'return-bypass*' }).Count) {
+                  Write-Host 'A return outside any function leaves the SCRIPT, skipping the trailing exit, so'
+                  Write-Host 'the caller reads a stale $LASTEXITCODE. Guard the block with if/else, or exit N.'
+              }
+              if (@($lintFail | Where-Object { $_ -notlike 'return-bypass*' }).Count) {
+                  Write-Host "Pass -Encoding explicitly. Accepted: $($okEncoding -join ', ')."
+                  Write-Host 'For a file another tool must read as UTF-8, prefer [IO.File]::WriteAllText with'
+                  Write-Host '[Text.UTF8Encoding]::new($false) -- it is the only way to get UTF-8 with no BOM'
+                  Write-Host 'out of 5.1, and JSON parsers are entitled to reject a BOM before the brace.'
+              }
+              Write-Host 'Raising a number in the allowlist is not the fix for any of these; it is the finding.'
+              exit 1
+          }
+          Write-Host ''
+          Write-Host 'Both AST recurrence lints are clean against their allowlists.'
 
       - name: Non-ASCII .ps1 files must carry a UTF-8 BOM
         shell: powershell

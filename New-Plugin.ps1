@@ -152,6 +152,105 @@ function Write-ScaffoldMcpConfig {
     }
 }
 
+# The placeholder rename, once, for both scaffold branches. It was two hand-written loops and
+# each one broke in its own way (ids 33, 40).
+#
+# ENCODING. Both loops read with Get-Content -Raw and wrote with Set-Content, neither passing
+# -Encoding, and under Windows PowerShell 5.1 that is the system ANSI codepage in both
+# directions. The templates are UTF-8 WITHOUT BOM, and five of the files that get rewritten
+# carry em-dashes (E2 80 94): CMakeLists.txt, README.md, src/main.cpp, src/Settings/Settings.h,
+# CMakeUserPresets.json.template. Measured against this repo's own template: on cp1252 the
+# decode/encode round-trip is byte-identical, which is the only reason this was never seen; on
+# cp932 the file comes back the same LENGTH with different bytes; on cp949 README.md comes back
+# 12 bytes shorter. CMakeLists.txt compiles the sources with /utf-8 AND /WX, so a mangled
+# em-dash inside a string literal is a hard build failure that looks like nothing to do with
+# scaffolding.
+#
+# WHICH FILES. The loops filtered by extension (.txt/.json/.cpp/.h/.md/.cmake and friends),
+# which is a guess at "is this text", and in rollingrock/sfse-template it guesses wrong twice:
+# the placeholder is also in .github/workflows/build.yml -- the upload-artifact name, so a
+# scaffolded repo publishes artifacts called sfse-template-plugin-Release -- and in LICENSE,
+# which has no extension at all. Both were skipped in silence. The extension test was
+# protecting something real: decoding a .dll or a .png as text and writing it back turns every
+# undecodable byte into U+FFFD and saves the damage. So it is replaced by asking the question
+# instead of guessing at it -- decode with a UTF8Encoding that THROWS on invalid bytes, and a
+# file that is not UTF-8 text says so itself. Verified over every file in both templates:
+# strict decode plus no-BOM re-encode returns the original bytes exactly, .clang-format's UTF-8
+# BOM included (GetString keeps the U+FEFF, the no-BOM encoder writes it straight back).
+#
+# AND IT SAYS WHAT IT MISSED. Every file whose bytes contain the placeholder is either
+# rewritten or named on the way out -- that invariant, not the file list, is what closes id 40,
+# because a whitelist that cannot say what it skipped is the same silence this pack is removing
+# everywhere else. The "does this file mention it at all" test decodes with latin-1, which maps
+# every byte to the character of the same number and so can neither throw nor lose one: a byte
+# search spelled as a string search, safe to run over a .png and a .md alike. The tree here is
+# the ~20 files of a fresh template; the CommonLibF4 submodule is not cloned until later.
+function Update-ScaffoldPlaceholder {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Placeholder,
+        [Parameter(Mandatory)][string]$Replacement,
+        # vcpkg manifest names forbid underscores, so vcpkg.json takes the hyphenated variant
+        # while everything else takes the token. Both templates carry the placeholder in that
+        # file as its "name" field and nowhere else in it. Empty means "no exception".
+        [string]$VcpkgReplacement = ''
+    )
+
+    $strict = [Text.UTF8Encoding]::new($false, $true)
+    $noBom = [Text.UTF8Encoding]::new($false)
+    $latin1 = [Text.Encoding]::GetEncoding(28591)
+
+    $changed = 0
+    $left = @()
+    $unreadable = @()
+    foreach ($f in (Get-ChildItem $RepoRoot -Recurse -File -Force)) {
+        # -Force enumerates hidden and system files, which is deliberate: a placeholder in a
+        # dotfile counts as much as one in a .cpp. But it also means this loop meets files it
+        # may not be able to open, and this script runs under $ErrorActionPreference='Stop' --
+        # so one unreadable file would abort the whole scaffold with a stack trace, after the
+        # template was copied and possibly after the multi-minute submodule clone, leaving a
+        # half-built project behind. A file we cannot read is not one we can rewrite, so it
+        # gets the same treatment as an undecodable one: named on the way out, and the run
+        # continues.
+        $bytes = $null
+        try { $bytes = [IO.File]::ReadAllBytes($f.FullName) }
+        catch { $unreadable += $f.FullName; continue }
+        if (-not $latin1.GetString($bytes).Contains($Placeholder)) { continue }
+        $text = ''
+        try { $text = $strict.GetString($bytes) }
+        catch { $left += $f.FullName; continue }
+        $to = $Replacement
+        if ($VcpkgReplacement -and $f.Name -eq 'vcpkg.json') { $to = $VcpkgReplacement }
+        # String.Replace is ordinal and literal. -replace takes a REGEX on both sides, and
+        # neither a placeholder nor a plugin name is one.
+        [IO.File]::WriteAllText($f.FullName, $text.Replace($Placeholder, $to), $noBom)
+        $changed++
+    }
+
+    if ($changed -gt 0) {
+        Write-Host "Renamed '$Placeholder' in $changed file(s)."
+    }
+    else {
+        Write-Host "NOTE: '$Placeholder' occurs nowhere under $RepoRoot, so nothing was renamed and this"
+        Write-Host 'scaffold still carries the template''s own names (project, log file, CI artifact). The'
+        Write-Host 'template changed its placeholder -- and the SF template is cloned fresh from GitHub on'
+        Write-Host 'every run, so it can change without anything in this pack being touched.'
+    }
+    if ($left.Count -gt 0) {
+        Write-Host "NOTE: '$Placeholder' also occurs in $($left.Count) file(s) whose bytes are not valid UTF-8. Those were"
+        Write-Host 'left exactly as the template shipped them -- rewriting one would replace every undecodable'
+        Write-Host 'byte with U+FFFD and save the result over the original:'
+        foreach ($p in $left) { Write-Host "  $p" }
+        Write-Host 'Edit them by hand if the name matters there.'
+    }
+    if ($unreadable.Count -gt 0) {
+        Write-Host "NOTE: $($unreadable.Count) file(s) could not be read, so this pass could not tell whether they"
+        Write-Host "mention '$Placeholder'. Nothing was written to them:"
+        foreach ($p in $unreadable) { Write-Host "  $p" }
+    }
+}
+
 if (Test-Path $target) { throw "Target already exists: $target" }
 if ($Game -eq 'SkyrimNG') {
     Write-Host 'Skyrim scaffolding is intentionally not duplicated here.'
@@ -211,24 +310,41 @@ instance-mode MO2 keeps it under %LOCALAPPDATA%\ModOrganizer\<game>\mods).
 
     Write-Host "Scaffolding $Name from templates/f4sevr-plugin ..."
     Copy-Item -Recurse (Join-Path $packRoot 'templates\f4sevr-plugin') $target
-    # Never carry a test build over into a new project.
-    Get-ChildItem $target -Directory -Filter 'build*' | Remove-Item -Recurse -Force
-
-    # Rename the placeholder project. File contents first...
-    $files = Get-ChildItem $target -Recurse -File | Where-Object { $_.Extension -in '.txt', '.json', '.cmake', '.cpp', '.h', '.in', '.md', '.toml', '.template' }
-    foreach ($f in $files) {
-        $c = Get-Content $f.FullName -Raw
-        if ($c -match 'starterplugin') {
-            Set-Content $f.FullName ($c -replace 'starterplugin', $token) -NoNewline
-        }
+    # templates\f4sevr-plugin is a WORKING directory, and Copy-Item -Recurse copies what is in
+    # it rather than what is committed -- so everything the template's own .gitignore hides
+    # ('build*/', '/.vs', '/CMakeUserPresets.json') rides along invisibly, because git status
+    # in this pack never mentions any of it. Only build* was being dropped; the comment that
+    # stood here ("Never carry a test build over") shows the built-in-place case was
+    # anticipated, and CMakeUserPresets.json is that same case with teeth. It is exactly what
+    # CMakeUserPresets.json.template invites you to write, it names an MO2_INSTALL_PATH, and
+    # CMakeLists.txt's MO2_INSTALL_PATH block attaches a POST_BUILD copy of the DLL and PDB to
+    # whatever path that names. The blast radius is narrower than it looks -- the copied
+    # .gitignore hides it in the scaffold too, so `git add -A` below never commits it, and the
+    # preset printed at the end (windows-vcpkg-vr) sets no MO2_INSTALL_PATH -- but an IDE preset
+    # picker lists 'vr-mo2' like any other, and one click then deploys this plugin into somebody
+    # else's mod folder. CMakeLists' configure-time guard does not catch that one either: it
+    # fails on a mods root that does not exist, and a leftover preset names one that does.
+    #
+    # Deleting unasked is safe HERE and nowhere else in this pack: $target did not exist a few
+    # lines ago (the Test-Path above threw if it did), so everything under it was created by
+    # this script, seconds ago, from files that are still sitting in templates\. The removals
+    # are still printed -- quietly dropping files a user put in the template is the same
+    # silence pointing the other way.
+    $carried = @(Get-ChildItem $target -Directory -Filter 'build*' -Force)
+    foreach ($n in '.vs', 'CMakeUserPresets.json') {
+        $p = Join-Path $target $n
+        if (Test-Path -LiteralPath $p) { $carried += Get-Item -LiteralPath $p -Force }
     }
+    foreach ($item in $carried) {
+        Write-Host "  dropped $($item.Name) -- a gitignored leftover of an in-place build, not part of the template."
+        Remove-Item -LiteralPath $item.FullName -Recurse -Force
+    }
+
+    # Rename the placeholder project. File contents first -- see Update-ScaffoldPlaceholder
+    # above for the encoding, and for what it does with a file it cannot rewrite.
+    Update-ScaffoldPlaceholder -RepoRoot $target -Placeholder 'starterplugin' -Replacement $token -VcpkgReplacement $vcpkgName
     # ...then the config file that carries the name.
     Rename-Item (Join-Path $target 'Data\F4SE\Plugins\starterplugin.toml') "$token.toml"
-
-    # vcpkg manifest names must be lowercase-hyphenated (no underscores).
-    $vcpkgManifest = Join-Path $target 'vcpkg.json'
-    (Get-Content $vcpkgManifest -Raw) -replace "`"name`": `"$token`"", "`"name`": `"$vcpkgName`"" |
-        Set-Content $vcpkgManifest -NoNewline
 
     Push-Location $target
     try {
@@ -249,7 +365,20 @@ instance-mode MO2 keeps it under %LOCALAPPDATA%\ModOrganizer\<game>\mods).
                     }
                 )
             }
-            $userPresets | ConvertTo-Json -Depth 5 | Set-Content 'CMakeUserPresets.json'
+            # UTF-8 with NO BOM through [IO.File], the same write as .mcp.json above, and here
+            # the stake is sharper: CMake requires a presets file to be UTF-8, and Set-Content's
+            # ANSI default quietly produces something else the moment -Mo2Path is not ASCII.
+            # Reproduced with the VS-bundled cmake, 3.31.6 and 4.3.1 alike: a presets file
+            # carrying the raw cp1252 byte for an accented letter parses with rc=0 and NO
+            # warning, and the deploy directory materialises with U+FFFD where that letter was
+            # -- cmake created "MO2 Jos<U+FFFD>" and reported success, while the line below
+            # printed the intact path. A silently mangled deploy target is exactly the failure
+            # the -Mo2Path checks above exist to prevent, arriving one step further down.
+            # Absolute path for the same reason Write-ScaffoldMcpConfig gives: this runs inside
+            # Push-Location $target, and [IO.File] resolves against the PROCESS directory, which
+            # Push-Location never changes.
+            [IO.File]::WriteAllText((Join-Path $target 'CMakeUserPresets.json'),
+                (($userPresets | ConvertTo-Json -Depth 5) + "`r`n"), [Text.UTF8Encoding]::new($false))
             Write-Host "MO2 auto-deploy preset written (deploys to $mo2)."
         }
 
@@ -286,14 +415,10 @@ elseif ($Game -eq 'SF') {
     Invoke-Git clone --depth 1 https://github.com/rollingrock/sfse-template.git $target
     Remove-Item -Recurse -Force (Join-Path $target '.git')
 
-    $files = Get-ChildItem $target -Recurse -File | Where-Object { $_.Extension -in '.txt', '.json', '.cpp', '.h', '.md', '.cmake' }
-    foreach ($f in $files) {
-        $c = Get-Content $f.FullName -Raw
-        if ($c -match 'sfse-template-plugin') {
-            $replacement = if ($f.Name -eq 'vcpkg.json') { $vcpkgName } else { $Name }
-            Set-Content $f.FullName ($c -replace 'sfse-template-plugin', $replacement) -NoNewline
-        }
-    }
+    # The same rewrite as the F4VR branch, from the same function -- this is the branch whose
+    # extension whitelist was missing .github/workflows/build.yml and LICENSE (id 40), and the
+    # branch that gets forgotten whenever the other one is fixed.
+    Update-ScaffoldPlaceholder -RepoRoot $target -Placeholder 'sfse-template-plugin' -Replacement $Name -VcpkgReplacement $vcpkgName
 
     Push-Location $target
     try {
