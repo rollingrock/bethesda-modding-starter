@@ -374,12 +374,16 @@ jobs:
           # A floor on how much was actually scanned. The heuristics above are matched
           # against YAML text, so they can quietly stop matching -- and with nothing to
           # scan this step printed its success line over an EMPTY scan, a check that passes
-          # because it checked nothing. Measured on this repo 2026-08-20: 33 blocks across
-          # the four workflow files (the per-file tally above is where that came from). The
-          # floor sits nine under it so ordinary step churn never turns CI red, while the
-          # failure this guards -- the run:/shell: matching breaking and the scan
-          # collapsing toward zero -- lands far below it.
-          $floor = 24
+          # because it checked nothing. Re-measured on this repo 2026-08-22: 40 blocks across
+          # the four workflow files -- e2e-build 10, ghidra-bringup 12, ghidra-drift 10,
+          # ps-compat 8 (the per-file tally above is where that came from). It was 33 on
+          # 2026-08-20; the seven new ones are the pinning layer, where each workflow gained
+          # steps that run a numbered script a second time and assert what it produced, plus
+          # the contract-tests job at the bottom of this file. The floor sits nine under the
+          # measurement so ordinary step churn never turns CI red, while the failure this
+          # guards -- the run:/shell: matching breaking and the scan collapsing toward zero --
+          # lands far below it.
+          $floor = 31
           if ($script:scanned -lt $floor) {
               Write-Host ''
               Write-Host "Only $($script:scanned) inline PowerShell block(s) scanned; expected at least $floor."
@@ -456,3 +460,40 @@ jobs:
           Smoke '90-verify'             { .\setup\90-verify.ps1 }
           if ($hardFail) { Write-Host ''; Write-Host 'A setup script threw.'; exit 1 }
           exit 0
+
+  # Everything in the job above judges the scripts by READING them. These three run them, over
+  # dirty state built on purpose, and assert what did not get destroyed: an unrelated process
+  # that must not be force-killed off a stale PID record, a directory of the user's own work
+  # that must not be deleted when a clone fails, and a vcpkg clone that must not be called ready
+  # when it cannot resolve the template's baseline. Those are the failures in this pack that
+  # cost something nobody can get back, and no AST query can see any of them -- each is a
+  # question about what a script DOES to state it did not create.
+  #
+  # A separate job, and deliberately not `needs: parse-5-1`: the two fail for unrelated reasons
+  # and both answers are worth having on one push. A script that stops parsing turns both red
+  # anyway, so serialising them would only cost wall time.
+  #
+  # Offline and cheap by construction -- measured at ~15 s for all three, no network, every
+  # path under the runner's TEMP. The fixtures refuse the shortcuts that would make them
+  # expensive or flaky: no fake HTTP server, no transcript corpus, no real vcpkg bootstrap. A
+  # flaky test here would be worse than none, because red is the only thing these three say.
+  # tests\run-all.ps1 documents why each fixture gets its own child powershell.exe.
+  contract-tests:
+    name: Dirty-state regression fixtures
+    runs-on: windows-latest
+    # The job above only READS files and cannot hang; this one launches processes, opens a
+    # loopback socket and makes HTTP probes, so it is the first job in this file with a way to
+    # stop making progress. Measured at ~15 s. The longest bounded path through it is
+    # 36-ghidra-mcp.ps1's probes if something else had taken the fixture's ephemeral port
+    # between the fixture releasing it and -Stop asking: /check_connection would answer, and
+    # each of the three cases would then wait out a 300 s /save_all_programs. Ten minutes
+    # clears the real run by 40x and still ends a wedged one in minutes instead of leaving a
+    # runner yellow for GitHub's six-hour default -- a job whose result nobody waits for is
+    # the alarm fatigue this review already removed once.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run the destructive-class regression fixtures
+        shell: powershell
+        run: .\tests\run-all.ps1

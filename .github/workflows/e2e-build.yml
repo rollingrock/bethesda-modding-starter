@@ -17,6 +17,18 @@ name: E2E scaffold + build (F4VR)
 # (This is only possible since the submodule moved to alandtse/CommonLibF4 -- the previous
 # fork could not compile on 14.5x, see CLAUDE.md Phase 3.)
 #
+# That claim is now ASSERTED rather than narrated, because nothing checked it: each leg carries
+# the VS major it is here to cover, the preflight step fails when the image no longer has it,
+# and the configure step records which Visual Studio cmake actually chose and fails when it is
+# not this leg's. Unpinned, cmake takes the NEWEST install it finds, so the day the two images
+# converge -- runner images are retired and re-pointed on GitHub's schedule, not ours -- both
+# legs would quietly build the identical toolchain, stay green, and the two-compiler guarantee
+# would be gone with nothing red to say so.
+#
+# Second runs where they are cheap, for the promise CLAUDE.md opens with ("re-running a phase
+# is safe"): 10-vcpkg.ps1 runs twice, and New-Plugin.ps1 is re-run over the scaffold it just
+# made to prove it REFUSES rather than copies the template over somebody's work.
+#
 # Failures write the relevant tail into the run summary and upload the vcpkg logs, so a
 # broken run can be diagnosed from the summary alone without pulling raw job logs.
 on:
@@ -27,13 +39,21 @@ on:
 
 jobs:
   scaffold-and-build:
-    name: Scaffold + build (${{ matrix.image }})
+    name: Scaffold + build (${{ matrix.image }}, VS ${{ matrix.vs }})
     runs-on: ${{ matrix.image }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
+      # `include` rather than a bare image list, so each leg can carry the Visual Studio major
+      # it exists to cover. That number is the whole of this matrix's value -- two images
+      # running the same compiler would be one build twice -- and until it was written down
+      # here, nothing could tell the difference.
       matrix:
-        image: [windows-2022, windows-latest]
+        include:
+          - image: windows-2022
+            vs: '17'
+          - image: windows-latest
+            vs: '18'
 
     steps:
       - uses: actions/checkout@v5
@@ -68,6 +88,19 @@ jobs:
               Write-Host '::error::No Visual Studio on this runner at all; nothing can build.'
               exit 1
           }
+          # THE LEG HAS TO CARRY THE COMPILER IT CLAIMS. This job's two legs exist to build the
+          # pack on two MSVC majors; GitHub retires and re-points its images on its own schedule,
+          # and the day windows-latest stops shipping 18 (or windows-2022 is retired onto a newer
+          # image) both legs would compile with the same toolchain and stay green -- the guarantee
+          # gone, with nothing red to say so. Missing here is a real finding, not a runner
+          # accident to shrug at.
+          $want = '${{ matrix.vs }}'
+          $have = @($vs | Where-Object { $_ -like "$want.*" })
+          if (-not $have.Count) {
+              Write-Host "::error::This is the Visual Studio $want leg, and the image it runs on (${{ matrix.image }}) has no $want.x install -- it has $($vs -join ', '). Re-point the leg at an image that carries $want.x, or change the major this leg claims; do not drop the assertion, it is the only thing keeping the two legs from silently becoming one."
+              exit 1
+          }
+          Write-Host "leg expects VS $want, image has $($have -join ', ')"
           Write-Host "free space:"
           Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null } |
               Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize | Out-String | Write-Host
@@ -94,6 +127,13 @@ jobs:
           # non-zero one and the job would instead fail later, in configure, with a vcpkg
           # error that says nothing about the bootstrap having failed.
           if ($LASTEXITCODE -ne 0) { throw "10-vcpkg.ps1 failed (exit $LASTEXITCODE)" }
+          # Twice, and the second run costs seconds because staleness is decided by running the
+          # tool (Test-VcpkgUsable: vcpkg.exe runs, and the manifest's pinned builtin-baseline is
+          # an ancestor of HEAD). What it pins is that a healthy clone is left alone: a re-run
+          # that re-bootstrapped, re-fetched or reported a clone it had just made usable as
+          # unusable is the "re-running a phase is safe" promise breaking on phase 1.
+          .\setup\10-vcpkg.ps1 -VcpkgDir $vcpkg -NoEnv
+          if ($LASTEXITCODE -ne 0) { throw "the second 10-vcpkg.ps1 run failed (exit $LASTEXITCODE) over a vcpkg the first one had just made ready" }
           # The manifest pins a builtin-baseline, so that commit must exist in this clone.
           $baseline = (Get-Content templates/f4sevr-plugin/vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
           Write-Host "manifest builtin-baseline: $baseline"
@@ -131,6 +171,26 @@ jobs:
           $log = & git -C $target log --oneline -1
           if (-not $log) { throw 'scaffold did not produce a commit' }
           Write-Host "scaffold commit: $log"
+          # Twice -- and here a second run must REFUSE. `Test-Path $target` throwing is what
+          # licenses the scaffolder to delete inside $target a few lines later (the gitignored
+          # build*/, .vs and CMakeUserPresets.json leftovers): everything under it was created
+          # by that same run, seconds earlier. Re-running over an existing directory instead of
+          # refusing would turn that cleanup loose on somebody's work.
+          $threw = ''
+          try { .\New-Plugin.ps1 -Name citest -Game F4VR -Dir $env:RUNNER_TEMP }
+          catch { $threw = "$($_.Exception.Message)"; Write-Host "expected throw: $threw" }
+          if (-not $threw) { throw 'New-Plugin.ps1 ran over an existing scaffold instead of refusing.' }
+          # WHICH throw, not merely that something threw. Delete the `Test-Path $target` guard
+          # and this re-run still throws -- Copy-Item, git init or the submodule clone will fail
+          # somewhere downstream, AFTER the cleanup has run over the directory -- so "it threw"
+          # is a check that passes either way, which is worse than none. Hold it to the guard's
+          # own refusal.
+          if ($threw -notmatch 'already exists') {
+              throw "New-Plugin.ps1 threw, but not its 'Target already exists' refusal -- it got further in than the guard: $threw"
+          }
+          # ...and it must have refused BEFORE touching anything: same one commit, same tree.
+          $after = @(& git -C $target log --oneline)
+          if ($after.Count -ne 1) { throw "the refused re-run left $($after.Count) commits in $target; it should have stopped before the copy." }
           exit 0
 
       - name: Configure (windows-vcpkg-vr)
@@ -151,6 +211,84 @@ jobs:
               Write-Host "::error::cmake configure failed (rc=$rc)"
               exit $rc
           }
+          exit 0
+
+      # WHICH Visual Studio did that configure actually take? Nothing recorded it, and the
+      # preset pins no generator, so on an image carrying two installs cmake silently picks the
+      # newest -- meaning the leg's NAME was the only claim about its compiler and the cache was
+      # the only place with the answer. Read it out of CMakeCache.txt (written by the configure
+      # above, so it cannot disagree with it), put it in the run summary, and hold it to the
+      # major this leg says it covers. A leg that says 17 and built with 18 is not a second data
+      # point, it is the first one run twice.
+      - name: Record the toolchain cmake selected, and hold the leg to it
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cache = Join-Path $env:RUNNER_TEMP 'citest\buildvr\CMakeCache.txt'
+          if (-not (Test-Path $cache)) { throw "no $cache -- configure did not leave one." }
+          $text = Get-Content $cache -Raw -Encoding UTF8
+          function Get-CacheEntry([string]$key, [string]$body) {
+              # CMakeCache lines are KEY:TYPE=VALUE, and the TYPE differs between entries
+              # (INTERNAL, STRING, FILEPATH), so match on the key and take the rest.
+              # ${key} braced, not $key: a colon straight after a variable name is a SCOPE
+              # qualifier to the 5.1 parser, and this file failed to parse until it was braced.
+              $m = [regex]::Match($body, "(?m)^${key}:[^=]*=(.*)$")
+              if ($m.Success) { return $m.Groups[1].Value.Trim() }
+              return ''
+          }
+          $generator = Get-CacheEntry 'CMAKE_GENERATOR' $text
+          # CMAKE_GENERATOR_INSTANCE is the VS install cmake bound to, and it does NOT have to
+          # agree with the generator's YEAR -- measured on a developer box here: generator
+          # 'Visual Studio 17 2022' with an instance under ...\Microsoft Visual Studio\18\.
+          # CMAKE_GENERATOR_TOOLSET, not CMAKE_VS_PLATFORM_TOOLSET: the second is a normal
+          # variable that a preset pinning no toolset never puts in the cache at all.
+          $instance = Get-CacheEntry 'CMAKE_GENERATOR_INSTANCE' $text
+          $toolset = Get-CacheEntry 'CMAKE_GENERATOR_TOOLSET' $text
+          # The linker path carries the MSVC toolset version in it (...\VC\Tools\MSVC\14.4x.y\...)
+          # and the compiler file beside the cache carries cl's own version. Between them, the
+          # 14.5x this workflow's header claims is a measured number rather than a story.
+          $linker = Get-CacheEntry 'CMAKE_LINKER' $text
+          $msvc = ''
+          $cl = ''
+          $cxx = @(Get-ChildItem (Join-Path $env:RUNNER_TEMP 'citest\buildvr\CMakeFiles') -Recurse -Filter 'CMakeCXXCompiler.cmake' -ErrorAction SilentlyContinue)
+          if ($cxx.Count) {
+              $cc = Get-Content $cxx[0].FullName -Raw -Encoding UTF8
+              $m = [regex]::Match($cc, 'set\(CMAKE_CXX_COMPILER_VERSION\s+"([^"]+)"')
+              if ($m.Success) { $msvc = $m.Groups[1].Value }
+              $m = [regex]::Match($cc, 'set\(CMAKE_CXX_COMPILER\s+"([^"]+)"')
+              if ($m.Success) { $cl = $m.Groups[1].Value }
+          }
+          Write-Host "generator : $generator"
+          Write-Host "VS install: $instance"
+          Write-Host "toolset   : $toolset"
+          Write-Host "cl.exe    : $cl"
+          Write-Host "cl version: $msvc"
+          Write-Host "linker    : $linker"
+          $lines = @(
+            "## Toolchain -- ${{ matrix.image }} (leg expects VS ${{ matrix.vs }})",
+            '',
+            '| | |',
+            '|---|---|',
+            "| generator | ``$generator`` |",
+            "| VS install | ``$instance`` |",
+            "| generator toolset | ``$toolset`` |",
+            "| cl.exe | ``$cl`` |",
+            "| cl version | ``$msvc`` |",
+            "| linker | ``$linker`` |"
+          )
+          $lines -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          # [regex]::Match rather than -notmatch + $Matches: the automatic variable's state after
+          # a NEGATED operator is not a thing worth betting a gate on.
+          $vsMatch = [regex]::Match($generator, 'Visual Studio (\d+)')
+          if (-not $vsMatch.Success) {
+              throw "CMAKE_GENERATOR is '$generator', which names no Visual Studio major -- this job's two legs are only distinguishable by that number."
+          }
+          $built = $vsMatch.Groups[1].Value
+          if ($built -ne '${{ matrix.vs }}') {
+              Write-Host "::error::This leg claims Visual Studio ${{ matrix.vs }} and cmake built with $built ($generator). The preset pins no generator, so cmake takes the newest install on the image: either this leg's expected major is stale, or the image now carries a newer VS and both legs are compiling the same toolchain."
+              exit 1
+          }
+          Write-Host "cmake selected VS $built, which is what this leg is for."
           exit 0
 
       - name: Build Release
@@ -183,6 +321,102 @@ jobs:
           $len = (Get-Item $dll).Length
           Write-Host "PASS: $dll ($len bytes)"
           "## PASS -- built ``citest.dll`` ($len bytes)" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          exit 0
+
+      # The FLAT preset. New-Plugin.ps1 scaffolds -Game F4 and -Game F4VR out of the same
+      # branch -- the only difference is which preset it prints at the end -- so the untested
+      # half of the F4 leg is the preset, not a second copy of the scaffolder. windows-vcpkg
+      # sets BUILD_FALLOUTVR=OFF and builds into build\ instead of buildvr\, and CI configured
+      # it exactly never: a preset that stopped resolving (a renamed hidden preset in the
+      # `inherits` list, a triplet typo) would ship green because the VR preset above never
+      # touches it, while CLAUDE.md hands flat-F4 users that command.
+      # Configure only, deliberately. CMakeLists.txt says BUILD_FALLOUTVR "only chooses which
+      # install this project deploys to and which build directory it uses" -- CommonLibF4
+      # dispatches at load time -- so a second full compile would re-prove the build above for
+      # roughly the ten minutes it costs. What is unproven is whether the preset resolves.
+      - name: Configure the flat preset (windows-vcpkg) -- the F4 half nothing configured
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $logFile = Join-Path $env:RUNNER_TEMP 'configure-flat.log'
+          Set-Location (Join-Path $env:RUNNER_TEMP 'citest')
+          cmake --preset windows-vcpkg 2>&1 | Tee-Object -FilePath $logFile
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+              "## Flat-preset configure failed (rc=$rc)" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              '```'                                      | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              Get-Content $logFile -Tail 150             | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              '```'                                      | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              Write-Host "::error::cmake --preset windows-vcpkg failed (rc=$rc)"
+              exit $rc
+          }
+          $ErrorActionPreference = 'Stop'
+          # It has to have landed in the OTHER directory with VR off, or it configured the VR
+          # preset again under a different name and proved nothing.
+          $cache = 'build\CMakeCache.txt'
+          if (-not (Test-Path $cache)) { throw "the flat preset produced no $cache -- its binaryDir is build\, not buildvr\." }
+          $vr = [regex]::Match((Get-Content $cache -Raw -Encoding UTF8), '(?m)^BUILD_FALLOUTVR:[^=]*=(.*)$')
+          if (-not $vr.Success) { throw "no BUILD_FALLOUTVR in $cache" }
+          Write-Host "flat preset: BUILD_FALLOUTVR=$($vr.Groups[1].Value.Trim())"
+          if ($vr.Groups[1].Value.Trim() -match '^(ON|TRUE|1)$') { throw 'the flat preset configured with BUILD_FALLOUTVR ON.' }
+          exit 0
+
+      # The Starfield branch of the scaffolder. It clones a different template, rewrites a
+      # different placeholder and writes the same generated .mcp.json -- and it is the branch
+      # that gets forgotten when the F4 one is fixed: id 40 landed here, where the placeholder
+      # rewrite skipped .github/workflows/build.yml and LICENSE in silence, and the dead
+      # hard-coded ghidra bridge path lived one branch further down than anyone was looking.
+      # Not built: SFSE needs commonlibsf and xmake, neither of which this job has. The scaffold
+      # is the part that had no coverage at all.
+      - name: Scaffold a Starfield plugin (the other template branch)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Capture what the scaffolder SAID and echo it back. Write-Host writes to the
+          # information stream under 5.1, hence 6>&1; the error stream is deliberately NOT
+          # merged, because git reports progress on stderr and merging it here would abort the
+          # step on a healthy clone. This is captured because the placeholder guarantee is not
+          # "every file is rewritten" -- it is "every file that mentions the placeholder is
+          # rewritten or NAMED on the way out", and only this output can settle the second half.
+          $out = @(.\New-Plugin.ps1 -Name sftest -Game SF -Dir $env:RUNNER_TEMP 6>&1 | ForEach-Object { "$_" })
+          if ($LASTEXITCODE -ne 0) { throw "New-Plugin.ps1 -Game SF exited $LASTEXITCODE." }
+          $out | ForEach-Object { Write-Host $_ }
+          $sf = Join-Path $env:RUNNER_TEMP 'sftest'
+          if (-not (Test-Path (Join-Path $sf 'CMakeLists.txt'))) { throw "no CMakeLists.txt under $sf" }
+          # This branch clones the template, deletes its .git and re-inits, so the commit below
+          # is the scaffold's own -- and it, too, has to happen with no git identity configured.
+          $log = @(& git -C $sf log --oneline)
+          if ($log.Count -ne 1) { throw "expected one scaffold commit in $sf, found $($log.Count)." }
+          Write-Host "scaffold commit: $($log[0])"
+          # The rename pass has to have done something at all: the SF template is cloned fresh
+          # from GitHub on every run, so it can change its placeholder without a byte of this
+          # pack being touched, and the scaffold would then carry the template's own project,
+          # log and CI-artifact names while every line printed success.
+          if (-not @($out | Where-Object { $_ -like "Renamed 'sfse-template-plugin'*" }).Count) {
+              throw 'the SF scaffold renamed nothing -- the template has changed its placeholder.'
+          }
+          # And anything still carrying the placeholder has to have been NAMED. A file that is
+          # not valid UTF-8 is deliberately left as the template shipped it (rewriting one would
+          # save U+FFFD over every undecodable byte), which is fine -- being left in SILENCE is
+          # the defect (id 40: the old extension whitelist skipped .github/workflows/build.yml
+          # and LICENSE without a word).
+          $stale = @(Get-ChildItem $sf -Recurse -File -Force |
+                     Where-Object { $_.FullName -notlike '*\.git\*' } |
+                     Select-String -Pattern 'sfse-template-plugin' -SimpleMatch -List |
+                     ForEach-Object { $_.Path })
+          foreach ($p in $stale) { Write-Host "still names the template: $p" }
+          $silent = @($stale | Where-Object { $f = $_; -not @($out | Where-Object { $_ -like "*$f*" }).Count })
+          if ($silent.Count) {
+              throw "$($silent.Count) file(s) still name the template and the run never mentioned them: $($silent -join ', ')."
+          }
+          # And the generated .mcp.json, which is what this branch used to commit with a bridge
+          # path hard-coded to C:/repos -- dead on any machine set up anywhere else, and silent.
+          $cfg = Get-Content (Join-Path $sf '.mcp.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+          $names = @($cfg.mcpServers.PSObject.Properties.Name)
+          Write-Host "servers: $($names -join ', ')"
+          foreach ($want in 'ghidra', 'x64dbg') {
+              if ($names -notcontains $want) { throw "the SF scaffold's .mcp.json has no '$want' server." }
+          }
           exit 0
 
       # Everything below only runs when something above broke. vcpkg buries the real
@@ -220,6 +454,7 @@ jobs:
           path: |
             ${{ runner.temp }}/configure.log
             ${{ runner.temp }}/build.log
+            ${{ runner.temp }}/configure-flat.log
           if-no-files-found: warn
 
       - name: Upload the built plugin

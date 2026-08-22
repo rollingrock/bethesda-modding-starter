@@ -12,12 +12,22 @@ name: Ghidra MCP bringup
 # is GOOD. The naming numbers in CLAUDE.md stay hand-measured for that reason.
 #
 # What it does cover, with no game assets at all:
+#   * setup/20-repos.ps1 clones ghidra-mcp -- the script that decides which fork and which
+#     branch a user gets, which this workflow used to bypass with its own `git clone`
 #   * gradlew builds the extension (no Maven -- there is no Apache.Maven package in winget)
 #   * the version gate: extension.properties version == the install's application.version
 #   * the headless server starts, serves its endpoints, and loads a program
+#   * the .mcp.json -WriteMcpConfigTo generates: it parses, it names a bridge that is on this
+#     machine, its URL is the port this run served, and BOTH servers are in it
 #   * the BRIDGE registers tools against it -- the actual "an agent gets tools" contract,
-#     which /mcp/schema answering does not by itself prove
+#     which /mcp/schema answering does not by itself prove -- driven from that .mcp.json
 #   * -Stop leaves no JVM behind (a killed one strands a project lock)
+#   * 40-x64dbg.ps1 installs the debugger half of that .mcp.json, and repairs a tree broken
+#     on purpose (a missing engine, a truncated plugin)
+#
+# And every script it runs, it runs TWICE. "Everything is idempotent; re-running a phase is
+# safe" is the first promise CLAUDE.md makes and no workflow tested it, so a second run that
+# re-cloned, rebuilt or rewrote what the first one had already produced was invisible here.
 #
 # This workflow runs ONE Ghidra version: 12.0.4, the known-good one this pack is verified
 # against, and every failure here is a real failure that blocks the push or the PR.
@@ -124,15 +134,39 @@ jobs:
           if (-not (Test-Path $props)) { throw "No application.properties under ${{ steps.rel.outputs.dir }}" }
           Get-Content $props | Select-String 'application.version|application.release.name'
 
-      - name: Clone ghidra-mcp
+      # ---------------------------------------------------------------- the pack's own script
+      # 20-repos.ps1, not a hand-rolled clone. This step used to be its own `git clone` of
+      # ghidra-mcp -- beside a 30-ghidra.ps1 that REFUSES to clone and tells the user to run
+      # setup/20-repos.ps1 first -- so the one script that decides which fork and which branch
+      # every user gets (ghidra-mcp, devbench, CommonLibF4, vr_address_tools) had zero execution
+      # coverage and was only ever parse-checked. That is precisely the territory of the
+      # devbench bug this pack already shipped once: feat/multigame-core cloned successfully,
+      # every check stayed green, and the in-game server never started on the machine that got
+      # it. -Only was added for this step; the full table pulls vr_address_tools, ~1.1 GB.
+      - name: 20-repos.ps1 -Only ghidra-mcp (the script that pins the fork)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force C:\repos | Out-Null
-          # Shallow: we build HEAD, we never need its history.
-          git clone --depth 1 https://github.com/bethington/ghidra-mcp.git C:\repos\ghidra-mcp
-          if ($LASTEXITCODE -ne 0) { throw 'clone failed' }
-          Write-Host "ghidra-mcp @ $(git -C C:\repos\ghidra-mcp rev-parse --short HEAD)"
+          # -CheckOnly first, on an empty C:\repos: 2 is "work pending", and it is the only
+          # answer that proves this run really cloned something rather than finding it.
+          .\setup\20-repos.ps1 -Root C:\repos -Only ghidra-mcp -CheckOnly
+          if ($LASTEXITCODE -ne 2) { throw "-CheckOnly on an empty C:\repos exited $LASTEXITCODE; expected 2 (work pending)." }
+          .\setup\20-repos.ps1 -Root C:\repos -Only ghidra-mcp
+          if ($LASTEXITCODE -ne 0) { throw "20-repos.ps1 failed (exit $LASTEXITCODE)." }
+          # Twice. The second run has to take the identity path -- origin matches the pinned
+          # URL, so the clone is adopted, nothing is re-cloned and nothing is deleted -- and
+          # still exit 0. A re-run that re-cloned, or that failed over the clone it had just
+          # made, is "re-running a phase is safe" breaking in the cheapest place to see it.
+          .\setup\20-repos.ps1 -Root C:\repos -Only ghidra-mcp
+          if ($LASTEXITCODE -ne 0) { throw "the second 20-repos.ps1 run exited $LASTEXITCODE." }
+          .\setup\20-repos.ps1 -Root C:\repos -Only ghidra-mcp -CheckOnly
+          if ($LASTEXITCODE -ne 0) { throw "-CheckOnly over the fresh clone exited $LASTEXITCODE; expected 0." }
+          # -CheckOnly above is the gate; this line is what puts the answer in the log, because
+          # "which fork, at which commit" is the first question a red run below raises.
+          $origin = & git -C C:\repos\ghidra-mcp remote get-url origin
+          if ($origin -ne 'https://github.com/bethington/ghidra-mcp.git') { throw "ghidra-mcp origin is $origin" }
+          Write-Host "ghidra-mcp @ $(git -C C:\repos\ghidra-mcp rev-parse --short HEAD) from $origin"
+          exit 0
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -141,7 +175,7 @@ jobs:
           key: gradle-${{ runner.os }}-${{ hashFiles('.github/workflows/ghidra-bringup.yml') }}
           restore-keys: gradle-${{ runner.os }}-
 
-      # ---------------------------------------------------------------- the pack's own script
+      # ---------------------------------------------------------------- build the extension
       - name: 30-ghidra.ps1 (build + deploy the extension, create the bridge venv)
         shell: powershell
         run: .\setup\30-ghidra.ps1 -GhidraPath '${{ steps.rel.outputs.dir }}'
@@ -170,6 +204,32 @@ jobs:
           if ($jars -lt 50) { throw "Classpath argfile has only $jars entries; expected the full Ghidra jar set." }
           Write-Host 'All artifacts present.'
 
+      # SECOND RUN. CLAUDE.md's opening paragraph promises "Everything is idempotent; re-running
+      # a phase is safe", and until this step no workflow ran any phase twice -- the headline
+      # claim of the whole runbook had zero coverage. The manifest is the cheapest place to hold
+      # it: 30-ghidra.ps1 writes setup\.ghidra-mcp-build.json only when a field it records has
+      # changed, so a re-run over an unchanged build must leave those bytes exactly as they were.
+      # A second run that picked a different Ghidra, rebuilt the venv into a different path, or
+      # rewrote the file for nothing lands here as a hash mismatch -- the skip-if-present class
+      # caught live rather than by reading the code.
+      - name: 30-ghidra.ps1 again -- a re-run must change nothing
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = '.\setup\.ghidra-mcp-build.json'
+          $before = (Get-FileHash $manifest -Algorithm SHA256).Hash
+          .\setup\30-ghidra.ps1 -GhidraPath '${{ steps.rel.outputs.dir }}'
+          if ($LASTEXITCODE -ne 0) { throw "the second 30-ghidra.ps1 run exited $LASTEXITCODE." }
+          $after = (Get-FileHash $manifest -Algorithm SHA256).Hash
+          if ($after -ne $before) {
+              Write-Host "before: $before"
+              Write-Host "after : $after"
+              Get-Content $manifest -Encoding UTF8
+              throw 'The second run rewrote setup\.ghidra-mcp-build.json. A re-run over an unchanged build must leave it byte-identical.'
+          }
+          Write-Host "Manifest unchanged across two runs (sha256 $before)."
+          exit 0
+
       # ---------------------------------------------------------------- headless server
       # ONE step on purpose. A background process does NOT survive the step that started
       # it on a Windows runner -- the runner tears down the step's process tree, so a
@@ -189,7 +249,15 @@ jobs:
           Write-Host '::group::-Start'
           $target = "$env:RUNNER_TEMP\subject.exe"
           Copy-Item C:\Windows\System32\where.exe $target -Force
-          .\setup\36-ghidra-mcp.ps1 -Start -File $target -TimeoutSec 600
+          # -WriteMcpConfigTo is the generator users are told produces their .mcp.json with the
+          # paths resolved for this machine, and no workflow had ever invoked it: a wrong bridge
+          # path or a port pinned to a server that is not there shipped green, and its first
+          # symptom is an agent session with no Ghidra tools in it -- the very contract this job
+          # exists to prove. An empty directory, so this takes the WRITE branch; the second
+          # -Start below takes the COMPARE branch against the file it leaves.
+          $cfgDir = "$env:RUNNER_TEMP\mcpcfg"
+          New-Item -ItemType Directory -Force $cfgDir | Out-Null
+          .\setup\36-ghidra-mcp.ps1 -Start -File $target -TimeoutSec 600 -WriteMcpConfigTo $cfgDir
           if ($LASTEXITCODE -ne 0) { throw "-Start reported failure (exit $LASTEXITCODE)." }
           Write-Host '::endgroup::'
 
@@ -222,11 +290,88 @@ jobs:
           Write-Host "decompiled ok    : $($dec.decompiled.Length) chars"
           Write-Host '::endgroup::'
 
+          Write-Host '::group::the .mcp.json an agent would load'
+          $cfgPath = Join-Path $cfgDir '.mcp.json'
+          if (-not (Test-Path $cfgPath)) { throw "-WriteMcpConfigTo produced no $cfgPath." }
+          # A UTF-8 BOM in front of the opening brace is enough on its own for a client to read
+          # NO servers at all, and 5.1's Set-Content -Encoding UTF8 writes one -- which is why
+          # the generator uses [IO.File]::WriteAllText. It has to be read as BYTES to see it:
+          # measured on 5.1, `Get-Content -Raw -Encoding UTF8` STRIPS the U+FEFF before
+          # ConvertFrom-Json is ever handed the text, so a BOM'd config parses perfectly. This
+          # step used to assert the BOM guarantee by parsing, which cannot fail either way.
+          $rawBytes = [IO.File]::ReadAllBytes($cfgPath)
+          if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
+              throw "$cfgPath starts with a UTF-8 BOM. An MCP client's JSON parser rejects it and loads no servers at all."
+          }
+          # Now parse it the way an MCP client does.
+          $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          $names = @($cfg.mcpServers.PSObject.Properties.Name)
+          Write-Host "servers        : $($names -join ', ')"
+          # BOTH servers. The inline builder this generator replaced left x64dbg out of every
+          # config 36-ghidra-mcp.ps1 wrote, while mcp\mcp.template.json (which New-Plugin.ps1
+          # copied) carried both and a hard-coded C:/repos bridge path -- each file was the fix
+          # for the other one's bug. Asserting one server would re-open half of that.
+          foreach ($want in 'ghidra', 'x64dbg') {
+              if ($names -notcontains $want) { throw "$cfgPath has no '$want' server (found: $($names -join ', '))." }
+          }
+          $cmd = "$($cfg.mcpServers.ghidra.command)"
+          $cfgUrl = "$($cfg.mcpServers.ghidra.env.GHIDRA_MCP_URL)"
+          $x64 = (@($cfg.mcpServers.x64dbg.args) -join ' ')
+          Write-Host "ghidra command : $cmd"
+          Write-Host "GHIDRA_MCP_URL : $cfgUrl"
+          Write-Host "x64dbg args    : $x64"
+          # The command has to be a bridge that is actually on this machine: the failure being
+          # closed is a config naming C:\repos\ghidra-mcp on a machine whose repos live
+          # elsewhere, which spawns nothing and says nothing.
+          if (-not (Test-Path $cmd)) { throw "the ghidra command in $cfgPath is not on this machine: $cmd" }
+          # ...and it has to be the path 30-ghidra.ps1 RECORDED, not New-McpConfigObject's
+          # hard-coded C:\repos\ghidra-mcp fallback. Test-Path alone cannot tell those two apart
+          # HERE, and only here: 30-ghidra.ps1's -GhidraMcpDir default is C:\repos\ghidra-mcp,
+          # which is exactly where the step above cloned it, so on this runner the guess and the
+          # truth are the same string. A manifest that had lost its bridgeExe -- the very case
+          # the generator prints a warning for -- would then ship green through a check whose
+          # whole subject is that path. Hold it against the manifest instead.
+          $recordedBridge = "$((Get-Content .\setup\.ghidra-mcp-build.json -Raw -Encoding UTF8 | ConvertFrom-Json).bridgeExe)".Trim()
+          Write-Host "manifest bridge: $recordedBridge"
+          if (-not $recordedBridge) { throw 'setup\.ghidra-mcp-build.json records no bridgeExe, so anything in the config can only be a guess.' }
+          if (($cmd -replace '/', '\') -ne ($recordedBridge -replace '/', '\')) {
+              throw "the config names $cmd; 30-ghidra.ps1 recorded $recordedBridge. The generator fell back to its C:\repos guess."
+          }
+          # And the URL has to name the port THIS run served on. 36-ghidra-mcp.ps1 documents
+          # -Port for a machine where 8089 is busy, and a config generated with the default then
+          # pins the bridge to a port nothing is listening on.
+          if ($cfgUrl.TrimEnd('/') -ne $base) { throw "the config pins $cfgUrl; this run served $base." }
+          # A version-pinned npx spec, because an unpinned x64dbg-mcp-server resolves to whatever
+          # is newest and fails at the handshake against the pinned .dp64, inside a session.
+          if ($x64 -notmatch 'x64dbg-mcp-server@\d+\.\d+\.\d+') { throw "the x64dbg server is not version-pinned: $x64" }
+          Write-Host '::endgroup::'
+
           # The REST endpoints answering is NOT the same as an agent getting tools; the
-          # bridge is what turns them into MCP tools. This is that contract.
+          # bridge is what turns them into MCP tools. This is that contract -- and it is driven
+          # from the FILE rather than from $base, because the file is what a session loads: a
+          # URL that is right in this job and wrong in the config is the failure worth catching.
           Write-Host '::group::bridge registers tools'
-          & C:\repos\ghidra-mcp\.venv\Scripts\python.exe .github\scripts\probe_bridge.py $base
+          $py = Join-Path (Split-Path $cmd -Parent) 'python.exe'
+          if (-not (Test-Path $py)) { throw "no python.exe beside the bridge named in $cfgPath ($py) -- that command cannot spawn." }
+          & $py .github\scripts\probe_bridge.py $cfgUrl
           if ($LASTEXITCODE -ne 0) { throw "probe_bridge.py failed (exit $LASTEXITCODE)." }
+          Write-Host '::endgroup::'
+
+          # Twice. A second -Start against a server that is already up takes the "Already
+          # running" path, and that path has to re-check three things rather than exit early:
+          # the tool count, the program loaded against the -File asked for, and the .mcp.json --
+          # now through the COMPARE branch, holding the file written above against what this run
+          # would write. Exit 0 is the generator agreeing with its own comparator; anything else
+          # is 2. That branch used to print the JSON, say "merge this in yourself" and exit 0
+          # without reading the file at all.
+          Write-Host '::group::-Start again (idempotence, and the compare branch)'
+          $cfgHash = (Get-FileHash $cfgPath -Algorithm SHA256).Hash
+          .\setup\36-ghidra-mcp.ps1 -Start -File $target -TimeoutSec 600 -WriteMcpConfigTo $cfgDir
+          if ($LASTEXITCODE -ne 0) { throw "the second -Start exited $LASTEXITCODE (expected 0: same server, same program, same config)." }
+          if ((Get-FileHash $cfgPath -Algorithm SHA256).Hash -ne $cfgHash) {
+              Get-Content $cfgPath -Encoding UTF8
+              throw 'the second -Start rewrote a matching .mcp.json; the compare branch must leave it alone.'
+          }
           Write-Host '::endgroup::'
 
           Write-Host '::group::-Status / -Stop'
@@ -252,6 +397,79 @@ jobs:
           }
           Write-Host 'Stopped cleanly: no JVM, port free.'
           Write-Host '::endgroup::'
+
+      # ---------------------------------------------------------------- x64dbg
+      # 40-x64dbg.ps1 was never executed by any workflow: the snapshot flatten, the install
+      # receipt and the size-checked plugin download all shipped on the strength of a parse,
+      # while .mcp.json's second server -- asserted above -- points at the very plugin this
+      # installs. -InstallDir and -BgsRoot both land in RUNNER_TEMP, so nothing here goes near
+      # C:\tools.
+      #
+      # If this step fails with a 403 from api.github.com, read it as the shared-runner rate
+      # limit on unauthenticated calls before reading it as a defect: this script resolves the
+      # x64dbg snapshot and the pinned MCP release through the public API with no token.
+      - name: 40-x64dbg.ps1 -- install, re-run, then repair a tree broken on purpose
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dbg = "$env:RUNNER_TEMP\x64dbg"
+          # No BethesdaGhidraScripts clone here (it is huge and needs game EXEs), so step 3 of
+          # that script has to report where it looked instead of prescribing hours of
+          # re-analysis -- and it must still exit 0, because a missing symbol export is not a
+          # failed x64dbg install.
+          $bgs = "$env:RUNNER_TEMP\no-such-bgs"
+
+          Write-Host '::group::first run (installs)'
+          .\setup\40-x64dbg.ps1 -InstallDir $dbg -BgsRoot $bgs
+          if ($LASTEXITCODE -ne 0) { throw "40-x64dbg.ps1 exited $LASTEXITCODE." }
+          $launcher = Join-Path $dbg 'x96dbg.exe'
+          $engine = Join-Path $dbg 'x64\x64dbg.exe'
+          $plugin = Join-Path $dbg 'x64\plugins\x64dbg_mcp.dp64'
+          $receiptPath = Join-Path $dbg '.starter-pack-install.json'
+          foreach ($p in @($launcher, $engine, $plugin, $receiptPath)) {
+              if (-not (Test-Path $p)) { throw "missing after a run that reported success: $p" }
+          }
+          # x96dbg.exe is only the ~199 KB picker; without x64\x64dbg.exe beside it the tree
+          # cannot debug a single 64-bit target, and 90-verify's plugin row passes on the .dp64
+          # alone -- so the engine is asserted here rather than assumed from the launcher.
+          $receipt = Get-Content $receiptPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          $receipt | Format-List
+          if ($receipt.preExisting -ne $false) { throw 'the receipt calls this tree pre-existing; this run created it, and only a pack-owned tree may be repaired.' }
+          if (-not $receipt.mcpVersion) { throw 'the receipt records no mcpVersion -- every release ships the .dp64 under the same name, so nothing else can say which one is on disk.' }
+          Write-Host '::endgroup::'
+
+          Write-Host '::group::second run (must change nothing)'
+          $before = (Get-FileHash $receiptPath -Algorithm SHA256).Hash
+          $pluginSize = (Get-Item $plugin).Length
+          .\setup\40-x64dbg.ps1 -InstallDir $dbg -BgsRoot $bgs
+          if ($LASTEXITCODE -ne 0) { throw "the second run exited $LASTEXITCODE." }
+          if ((Get-FileHash $receiptPath -Algorithm SHA256).Hash -ne $before) {
+              Get-Content $receiptPath -Encoding UTF8
+              throw 'the second run rewrote the receipt though nothing it records had changed; its "at" is meant to say when this state came to be.'
+          }
+          if ((Get-Item $plugin).Length -ne $pluginSize) { throw 're-run replaced a plugin it had just verified.' }
+          Write-Host "receipt unchanged (sha256 $before), plugin still $pluginSize bytes"
+          Write-Host '::endgroup::'
+
+          Write-Host '::group::mutate, then repair'
+          # The one leg that would have caught the Move-Item defect found in this batch: on a
+          # tree that already had x64\ and x32\, the repair threw "Cannot create a file when
+          # that file already exists", exited 1, left the engine still missing AND a stray
+          # release\ inside the install dir, and a re-run reproduced it exactly -- the tree came
+          # out worse than it went in. Both mutations below are things that really happen:
+          # Defender quarantines x64\x64dbg.exe, and an interrupted download leaves the front
+          # half of a .dp64 that x64dbg then refuses to load.
+          Remove-Item $engine -Force
+          Set-Content $plugin -Value 'truncated' -Encoding ascii
+          .\setup\40-x64dbg.ps1 -InstallDir $dbg -BgsRoot $bgs
+          if ($LASTEXITCODE -ne 0) { throw "the repair run exited $LASTEXITCODE -- a tree this pack's own receipt claims it created has to be repairable." }
+          if (-not (Test-Path $engine)) { throw "$engine was not restored." }
+          $now = (Get-Item $plugin).Length
+          if ($now -ne $pluginSize) { throw "the truncated plugin is $now bytes; the release publishes $pluginSize." }
+          if (Test-Path (Join-Path $dbg 'release')) { throw "the flatten left a release\ directory inside $dbg." }
+          Write-Host 'Repaired: engine back, plugin back to its published size, no stray release\.'
+          Write-Host '::endgroup::'
+          exit 0
 
       # ---------------------------------------------------------------- error paths
       # These are contracts an agent depends on: a script that fails clearly is the

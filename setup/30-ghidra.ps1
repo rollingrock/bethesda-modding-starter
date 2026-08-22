@@ -402,8 +402,44 @@ $manifest = [ordered]@{
     guiDeployed    = (-not $HeadlessOnly)
 }
 $manifestPath = Join-Path $PSScriptRoot '.ghidra-mcp-build.json'
-$manifest | ConvertTo-Json | Set-Content $manifestPath -Encoding UTF8
-Write-Host "Wrote $manifestPath"
+# Written ONLY when something it records has changed, and generatedAt is the field that makes
+# that a rule rather than tidiness: rewritten unconditionally it turns every re-run over an
+# unchanged build into a new file, so the cheapest machine-checkable form of "re-running a phase
+# is safe" -- CI runs this script twice and compares these bytes -- would be asserting nothing
+# but the clock. Left alone, generatedAt keeps meaning WHEN this build came to be rather than
+# when something last looked at it, which is also what makes it worth reading. 40-x64dbg.ps1's
+# install receipt is written under the same rule, for the same two reasons.
+$unchanged = $false
+if (Test-Path $manifestPath) {
+    try {
+        $prev = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $unchanged = $true
+        foreach ($k in $manifest.Keys) {
+            if ($k -eq 'generatedAt') { continue }
+            # Ask the property bag, not the property: a manifest written before a field existed
+            # hands back $null for it, which compares equal to an empty string and would freeze
+            # the gap in place. Absent counts as CHANGED so the next run fills it in.
+            $prop = $null
+            if ($prev) { $prop = $prev.PSObject.Properties[$k] }
+            if (-not $prop -or "$($prop.Value)" -ne "$($manifest[$k])") { $unchanged = $false; break }
+        }
+        # The shape as well as the values: a file carrying a field this version has STOPPED
+        # recording matches every check above and would otherwise be kept forever.
+        if ($unchanged -and @($prev.PSObject.Properties).Count -ne $manifest.Keys.Count) { $unchanged = $false }
+    }
+    catch {
+        # A manifest that will not parse is not evidence of anything, least of all that this
+        # build is already recorded. Rewrite it.
+        $unchanged = $false
+    }
+}
+if ($unchanged) {
+    Write-Host "$manifestPath already describes this build - left untouched."
+}
+else {
+    $manifest | ConvertTo-Json | Set-Content $manifestPath -Encoding UTF8
+    Write-Host "Wrote $manifestPath"
+}
 
 Write-Host ''
 Write-Host 'Next: .\setup\36-ghidra-mcp.ps1 -Start   (headless MCP server, no GUI, no clicks)'

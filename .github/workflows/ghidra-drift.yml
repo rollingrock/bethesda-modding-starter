@@ -4,9 +4,12 @@ name: Ghidra drift detector
 # release instead of the pinned 12.0.4 this pack is verified against. Its job is to find out
 # that a new Ghidra broke ghidra-mcp's compile, or the version gate, or the headless
 # server, on a Monday morning here -- rather than on a user's fresh machine, where the
-# symptom is an extension Ghidra silently refuses to load. It skips only the error-path
-# assertions, which are about how this pack's own scripts report missing inputs and cannot
-# drift with a Ghidra release.
+# symptom is an extension Ghidra silently refuses to load. It skips two things, and only
+# because neither can drift with a Ghidra release: the error-path assertions, which are about
+# how this pack's own scripts report missing inputs, and the 40-x64dbg.ps1 install-and-repair
+# leg, which touches no Ghidra at all and would spend the weekly run's bandwidth re-proving
+# ghidra-bringup.yml's answer. Everything a new Ghidra CAN break is here, twice where the
+# pinned run does it twice.
 #
 # WHY THIS IS A SEPARATE FILE and not a second matrix leg in ghidra-bringup.yml: as a leg
 # it needed continue-on-error, because a Ghidra release that ghidra-mcp has not caught up
@@ -109,15 +112,31 @@ jobs:
           if (-not (Test-Path $props)) { throw "No application.properties under ${{ steps.rel.outputs.dir }}" }
           Get-Content $props | Select-String 'application.version|application.release.name'
 
-      - name: Clone ghidra-mcp
+      # ---------------------------------------------------------------- the pack's own script
+      # 20-repos.ps1 rather than a hand-rolled clone, for the reason spelled out in
+      # ghidra-bringup.yml: 30-ghidra.ps1 below REFUSES to clone and points at this script, so a
+      # workflow that cloned for itself left the one place that pins the fork and the branch
+      # with no execution coverage at all. -Only keeps vr_address_tools (~1.1 GB) out of it.
+      - name: 20-repos.ps1 -Only ghidra-mcp (the script that pins the fork)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force C:\repos | Out-Null
-          # Shallow: we build HEAD, we never need its history.
-          git clone --depth 1 https://github.com/bethington/ghidra-mcp.git C:\repos\ghidra-mcp
-          if ($LASTEXITCODE -ne 0) { throw 'clone failed' }
-          Write-Host "ghidra-mcp @ $(git -C C:\repos\ghidra-mcp rev-parse --short HEAD)"
+          # -CheckOnly first, on an empty C:\repos: 2 is "work pending", and it is the only
+          # answer that proves this run really cloned something rather than finding it.
+          .\setup\20-repos.ps1 -Root C:\repos -Only ghidra-mcp -CheckOnly
+          if ($LASTEXITCODE -ne 2) { throw "-CheckOnly on an empty C:\repos exited $LASTEXITCODE; expected 2 (work pending)." }
+          .\setup\20-repos.ps1 -Root C:\repos -Only ghidra-mcp
+          if ($LASTEXITCODE -ne 0) { throw "20-repos.ps1 failed (exit $LASTEXITCODE)." }
+          # Twice, the same as the pinned run: the second one must adopt the clone on identity
+          # and exit 0 without re-cloning or deleting anything.
+          .\setup\20-repos.ps1 -Root C:\repos -Only ghidra-mcp
+          if ($LASTEXITCODE -ne 0) { throw "the second 20-repos.ps1 run exited $LASTEXITCODE." }
+          .\setup\20-repos.ps1 -Root C:\repos -Only ghidra-mcp -CheckOnly
+          if ($LASTEXITCODE -ne 0) { throw "-CheckOnly over the fresh clone exited $LASTEXITCODE; expected 0." }
+          $origin = & git -C C:\repos\ghidra-mcp remote get-url origin
+          if ($origin -ne 'https://github.com/bethington/ghidra-mcp.git') { throw "ghidra-mcp origin is $origin" }
+          Write-Host "ghidra-mcp @ $(git -C C:\repos\ghidra-mcp rev-parse --short HEAD) from $origin"
+          exit 0
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -126,7 +145,7 @@ jobs:
           key: gradle-${{ runner.os }}-${{ hashFiles('.github/workflows/ghidra-drift.yml') }}
           restore-keys: gradle-${{ runner.os }}-
 
-      # ---------------------------------------------------------------- the pack's own script
+      # ---------------------------------------------------------------- build the extension
       # This is the step drift usually breaks: GhidraMCP compiles against Ghidra's own jars,
       # so a new release that moves or renames an API fails the build here.
       - name: 30-ghidra.ps1 (build + deploy the extension, create the bridge venv)
@@ -157,6 +176,30 @@ jobs:
           if ($jars -lt 50) { throw "Classpath argfile has only $jars entries; expected the full Ghidra jar set." }
           Write-Host 'All artifacts present.'
 
+      # SECOND RUN, same as ghidra-bringup.yml: 30-ghidra.ps1 writes its manifest only when a
+      # field it records has changed, so a re-run over an unchanged build must leave those bytes
+      # exactly as they were. Here it carries one extra question the pinned run cannot ask --
+      # whether a NEW Ghidra makes the second run pick something different (a renamed profile
+      # directory, a second install in ToolsDir) and rewrite the manifest under a build nothing
+      # rebuilt.
+      - name: 30-ghidra.ps1 again -- a re-run must change nothing
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = '.\setup\.ghidra-mcp-build.json'
+          $before = (Get-FileHash $manifest -Algorithm SHA256).Hash
+          .\setup\30-ghidra.ps1 -GhidraPath '${{ steps.rel.outputs.dir }}'
+          if ($LASTEXITCODE -ne 0) { throw "the second 30-ghidra.ps1 run exited $LASTEXITCODE." }
+          $after = (Get-FileHash $manifest -Algorithm SHA256).Hash
+          if ($after -ne $before) {
+              Write-Host "before: $before"
+              Write-Host "after : $after"
+              Get-Content $manifest -Encoding UTF8
+              throw 'The second run rewrote setup\.ghidra-mcp-build.json. A re-run over an unchanged build must leave it byte-identical.'
+          }
+          Write-Host "Manifest unchanged across two runs (sha256 $before)."
+          exit 0
+
       # ---------------------------------------------------------------- headless server
       # ONE step on purpose. A background process does NOT survive the step that started
       # it on a Windows runner -- the runner tears down the step's process tree, so a
@@ -176,7 +219,12 @@ jobs:
           Write-Host '::group::-Start'
           $target = "$env:RUNNER_TEMP\subject.exe"
           Copy-Item C:\Windows\System32\where.exe $target -Force
-          .\setup\36-ghidra-mcp.ps1 -Start -File $target -TimeoutSec 600
+          # -WriteMcpConfigTo, the same as the pinned run: the generated .mcp.json names the
+          # bridge exe 30-ghidra.ps1 recorded, and a new Ghidra is exactly what moves that path
+          # (a changed profile directory, a rebuilt venv) without anything else noticing.
+          $cfgDir = "$env:RUNNER_TEMP\mcpcfg"
+          New-Item -ItemType Directory -Force $cfgDir | Out-Null
+          .\setup\36-ghidra-mcp.ps1 -Start -File $target -TimeoutSec 600 -WriteMcpConfigTo $cfgDir
           if ($LASTEXITCODE -ne 0) { throw "-Start reported failure (exit $LASTEXITCODE)." }
           Write-Host '::endgroup::'
 
@@ -209,11 +257,68 @@ jobs:
           Write-Host "decompiled ok    : $($dec.decompiled.Length) chars"
           Write-Host '::endgroup::'
 
+          Write-Host '::group::the .mcp.json an agent would load'
+          $cfgPath = Join-Path $cfgDir '.mcp.json'
+          if (-not (Test-Path $cfgPath)) { throw "-WriteMcpConfigTo produced no $cfgPath." }
+          # The BOM read as BYTES, because 5.1's Get-Content -Encoding UTF8 strips a U+FEFF
+          # before ConvertFrom-Json sees it -- parsing can never catch the thing a BOM breaks.
+          # See ghidra-bringup.yml for the measurement and for what each check below used to
+          # ship broken.
+          $rawBytes = [IO.File]::ReadAllBytes($cfgPath)
+          if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
+              throw "$cfgPath starts with a UTF-8 BOM. An MCP client's JSON parser rejects it and loads no servers at all."
+          }
+          # Then parsed the way an MCP client parses it, and held to what the generator exists
+          # to get right.
+          $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          $names = @($cfg.mcpServers.PSObject.Properties.Name)
+          Write-Host "servers        : $($names -join ', ')"
+          foreach ($want in 'ghidra', 'x64dbg') {
+              if ($names -notcontains $want) { throw "$cfgPath has no '$want' server (found: $($names -join ', '))." }
+          }
+          $cmd = "$($cfg.mcpServers.ghidra.command)"
+          $cfgUrl = "$($cfg.mcpServers.ghidra.env.GHIDRA_MCP_URL)"
+          $x64 = (@($cfg.mcpServers.x64dbg.args) -join ' ')
+          Write-Host "ghidra command : $cmd"
+          Write-Host "GHIDRA_MCP_URL : $cfgUrl"
+          Write-Host "x64dbg args    : $x64"
+          if (-not (Test-Path $cmd)) { throw "the ghidra command in $cfgPath is not on this machine: $cmd" }
+          # Test-Path cannot tell the recorded path from the generator's C:\repos\ghidra-mcp
+          # fallback on this runner -- they are the same string here -- so hold it against the
+          # manifest, which is the only thing that says the config was GENERATED rather than
+          # guessed. A new Ghidra moving the bridge (a renamed profile, a rebuilt venv) is
+          # exactly the drift this workflow is for.
+          $recordedBridge = "$((Get-Content .\setup\.ghidra-mcp-build.json -Raw -Encoding UTF8 | ConvertFrom-Json).bridgeExe)".Trim()
+          Write-Host "manifest bridge: $recordedBridge"
+          if (-not $recordedBridge) { throw 'setup\.ghidra-mcp-build.json records no bridgeExe, so anything in the config can only be a guess.' }
+          if (($cmd -replace '/', '\') -ne ($recordedBridge -replace '/', '\')) {
+              throw "the config names $cmd; 30-ghidra.ps1 recorded $recordedBridge. The generator fell back to its C:\repos guess."
+          }
+          if ($cfgUrl.TrimEnd('/') -ne $base) { throw "the config pins $cfgUrl; this run served $base." }
+          if ($x64 -notmatch 'x64dbg-mcp-server@\d+\.\d+\.\d+') { throw "the x64dbg server is not version-pinned: $x64" }
+          Write-Host '::endgroup::'
+
           # The REST endpoints answering is NOT the same as an agent getting tools; the
-          # bridge is what turns them into MCP tools. This is that contract.
+          # bridge is what turns them into MCP tools. This is that contract, driven from the
+          # FILE rather than from $base, because the file is what a session actually loads.
           Write-Host '::group::bridge registers tools'
-          & C:\repos\ghidra-mcp\.venv\Scripts\python.exe .github\scripts\probe_bridge.py $base
+          $py = Join-Path (Split-Path $cmd -Parent) 'python.exe'
+          if (-not (Test-Path $py)) { throw "no python.exe beside the bridge named in $cfgPath ($py) -- that command cannot spawn." }
+          & $py .github\scripts\probe_bridge.py $cfgUrl
           if ($LASTEXITCODE -ne 0) { throw "probe_bridge.py failed (exit $LASTEXITCODE)." }
+          Write-Host '::endgroup::'
+
+          # Twice. The "Already running" path re-checks the tool count, the loaded program and
+          # the .mcp.json through its COMPARE branch; exit 0 is the generator agreeing with its
+          # own comparator. See the same block in ghidra-bringup.yml.
+          Write-Host '::group::-Start again (idempotence, and the compare branch)'
+          $cfgHash = (Get-FileHash $cfgPath -Algorithm SHA256).Hash
+          .\setup\36-ghidra-mcp.ps1 -Start -File $target -TimeoutSec 600 -WriteMcpConfigTo $cfgDir
+          if ($LASTEXITCODE -ne 0) { throw "the second -Start exited $LASTEXITCODE (expected 0: same server, same program, same config)." }
+          if ((Get-FileHash $cfgPath -Algorithm SHA256).Hash -ne $cfgHash) {
+              Get-Content $cfgPath -Encoding UTF8
+              throw 'the second -Start rewrote a matching .mcp.json; the compare branch must leave it alone.'
+          }
           Write-Host '::endgroup::'
 
           Write-Host '::group::-Status / -Stop'

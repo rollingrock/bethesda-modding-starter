@@ -11,6 +11,10 @@
 
     -CheckOnly reports each repo's identity and clones nothing.
 
+    -Only <names> narrows the table below to the repos you name, for both modes. It exists so
+    CI can execute THIS script for one repo instead of hand-rolling a `git clone` beside it --
+    the full set pulls vr_address_tools, ~1.1 GB.
+
     What and why:
       CommonLibF4        alandtse/CommonLibF4 — NG-style with runtime dispatch: ENABLE_FALLOUT_F4
                          /_NG/_VR default ON, so ONE DLL serves pre-NG Fallout 4, the Next-Gen
@@ -43,6 +47,18 @@
 param(
     [string]$Root = 'C:\repos',
     [switch]$SkipAddressTools,  # skip the ~1.1 GB vr_address_tools clone
+
+    # Work on just these repos, named by the Name column of the table below (both modes).
+    # CI is what needs it, and the need is not convenience: the Ghidra bringup workflow used to
+    # run its own `git clone` of ghidra-mcp because cloning the whole table pulls
+    # vr_address_tools -- so THIS script, the one place that decides which fork and which branch
+    # every user gets, had zero execution coverage and was only parse-checked. That is exactly
+    # where the devbench bug lived (feat/multigame-core cloned successfully, every check stayed
+    # green, and the Fallout server never started on the machine that got it).
+    # A name that is not in the table is a hard failure rather than an empty selection: `-Only
+    # ghidra_mcp` matching nothing, cloning nothing and exiting 0 is the same silence in a
+    # smaller package.
+    [string[]]$Only = @(),
 
     # Report what each repo IS; clone nothing. Exit 0 = every wanted repo is present and came
     # from the pinned URL, 2 = work is pending (something is missing or is a different repo),
@@ -103,6 +119,23 @@ if (-not $SkipAddressTools) {
     $repos += @{ Name = 'vr_address_tools'; Url = 'https://github.com/alandtse/vr_address_tools.git'; Args = @('--recurse-submodules') }
 }
 
+# -Only filters the ONE table above, before either mode reads it, so a narrowed run and a full
+# run can only ever disagree about which rows they cover -- never about what a row means.
+if ($Only.Count) {
+    $unknown = @($Only | Where-Object { $n = $_; -not @($repos | Where-Object { $_.Name -eq $n }).Count })
+    if ($unknown.Count) {
+        # -SkipAddressTools has already removed a row by the time we get here, so say so rather
+        # than let the two flags contradict each other under one confusing message.
+        $skipNote = ''
+        if ($SkipAddressTools) { $skipNote = ' (-SkipAddressTools has already removed vr_address_tools from it)' }
+        throw ("-Only names $($unknown -join ', '), which is not in this script's repo table$skipNote. Known names: " +
+            (@($repos | ForEach-Object { $_.Name }) -join ', ') +
+            ". Refusing to run: a typo that simply matched nothing would clone nothing and exit 0.")
+    }
+    $repos = @($repos | Where-Object { $Only -contains $_.Name })
+    Write-Host "-Only: $(@($repos | ForEach-Object { $_.Name }) -join ', ')"
+}
+
 # ---- -CheckOnly: the same table, the same predicate, nothing written ----
 # One loop over the table above, so the answer this reports and the decision the clone loop
 # below makes can never drift apart -- they are the same call to Test-RepoIdentity. Answering
@@ -117,7 +150,9 @@ if ($CheckOnly) {
         Write-ProbeResult $id
         if ("$($id.Status)" -ne 'OK') { $pending++ }
     }
-    if ($SkipAddressTools) {
+    # Not printed under -Only: that run was never about the whole table, so a line explaining
+    # why one unnamed repo is absent reads as though the others were covered.
+    if ($SkipAddressTools -and -not $Only.Count) {
         # Reported, but NOT pending: the caller asked for this repo to be skipped, and calling
         # a declined repo "work pending" is how a healthy machine ends up permanently non-zero.
         # Silence would be worse than either -- a reader would take it for present.
