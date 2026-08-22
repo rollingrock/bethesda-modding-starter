@@ -65,6 +65,23 @@ $ErrorActionPreference = 'Stop'
 # used to sit in the param block was asking a human to do by hand.
 if (-not $McpVersion) { $McpVersion = $script:X64dbgMcpReleaseTag }
 
+# Both release lookups below go to the GitHub API, and UNAUTHENTICATED that API allows 60
+# requests per hour PER IP. On a developer's machine that is uncountably generous. On a hosted
+# CI runner the IP is shared with every other job on that Azure host, so the budget is often
+# already spent by someone else -- measured here: "API rate limit exceeded for 48.214.54.98"
+# on the first call, a red build caused by a stranger's workflow. Authenticated, the limit is
+# 1000/hour for the repository, which makes the same call reliable.
+# GH_TOKEN/GITHUB_TOKEN is what Actions exposes; a developer normally has neither set, and gets
+# exactly today's behaviour. This is why the token is read rather than required: the script has
+# to work with no GitHub account at all, and merely work MORE RELIABLY where one is present.
+$script:GitHubApiArgs = @{ Headers = @{ 'User-Agent' = 'bethesda-modding-starter' } }
+$ghToken = "$env:GH_TOKEN".Trim()
+if (-not $ghToken) { $ghToken = "$env:GITHUB_TOKEN".Trim() }
+if ($ghToken) {
+    $script:GitHubApiArgs.Headers['Authorization'] = "Bearer $ghToken"
+    Write-Host 'Using GH_TOKEN for the GitHub release lookups (higher rate limit).'
+}
+
 # -BgsRoot derives from -Root, and that cannot be a parameter default either -- for a different
 # reason than the pin above. `[string]$BgsRoot = (Join-Path $Root 'BethesdaGhidraScripts')` does
 # bind in declaration order and does see $Root, but Join-Path resolves the DRIVE through the
@@ -199,7 +216,7 @@ else {
         Write-Host "The x64dbg at $InstallDir is incomplete -- $engineExe is missing. Re-extracting over it."
     }
     Write-Host 'Downloading the latest x64dbg snapshot ...'
-    $rel = Invoke-RestMethod 'https://api.github.com/repos/x64dbg/x64dbg/releases/latest'
+    $rel = Invoke-RestMethod 'https://api.github.com/repos/x64dbg/x64dbg/releases/latest' @script:GitHubApiArgs
     $asset = $rel.assets | Where-Object name -like 'snapshot_*.zip' | Select-Object -First 1
     if (-not $asset) { $asset = $rel.assets | Where-Object name -like '*.zip' | Select-Object -First 1 }
     # Recorded on the receipt below: the snapshot names carry a date, so it is the only line
@@ -259,7 +276,7 @@ if ($receiptStale) {
 
 # 2. MCP plugin (pinned release; local build only needed to match a custom commit)
 $relUrl = "https://api.github.com/repos/bromoket/x64dbg_mcp/releases/tags/$McpVersion"
-$rel = Invoke-RestMethod $relUrl
+$rel = Invoke-RestMethod $relUrl @script:GitHubApiArgs
 
 # Resolve BOTH assets before writing anything, so an adopted install can be told the exact files
 # this pack is about to add to it -- and so that list is the whole of what it adds. The release's

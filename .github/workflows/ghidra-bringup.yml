@@ -405,11 +405,18 @@ jobs:
       # installs. -InstallDir and -BgsRoot both land in RUNNER_TEMP, so nothing here goes near
       # C:\tools.
       #
-      # If this step fails with a 403 from api.github.com, read it as the shared-runner rate
-      # limit on unauthenticated calls before reading it as a defect: this script resolves the
-      # x64dbg snapshot and the pinned MCP release through the public API with no token.
+      # GH_TOKEN is passed because both of this script's release lookups go to the GitHub API,
+      # and unauthenticated that API allows 60 requests per hour PER IP -- an IP this runner
+      # shares with every other job on its Azure host. This leg failed exactly that way on its
+      # first real run ("API rate limit exceeded for 48.214.54.98"), red through no fault of
+      # this repository. Authenticated it is 1000/hour for the repo. The script reads the token
+      # rather than requiring it, so a developer with no GitHub account still gets today's
+      # behaviour; a documented-flaky check would have been the worse answer, because a job that
+      # goes red at random teaches its readers to stop believing red at all.
       - name: 40-x64dbg.ps1 -- install, re-run, then repair a tree broken on purpose
         shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           $dbg = "$env:RUNNER_TEMP\x64dbg"
