@@ -9,12 +9,22 @@
     Games:
       F4VR / F4  -> vendored templates/f4sevr-plugin. alandtse/CommonLibF4 dispatches at
                     runtime, so ONE DLL serves flat F4, Next-Gen and VR. windows-vcpkg-vr
-                    deploys to the VR install and builds into buildvr/; windows-vcpkg targets
-                    the flat install and builds into build/. Both take whatever Visual Studio
-                    is present; vs2019/vs2022/vs2026 variants exist if you need to pin one.
+                    builds into buildvr/, windows-vcpkg into build/, and NEITHER deploys
+                    anything: COPY_BUILD defaults FALSE and neither of them sets it, so
+                    BUILD_FALLOUTVR only decides which install a deploy WOULD target. Both
+                    take whatever Visual Studio is present; CMakePresets.json's vs2022-* and
+                    vs2026-* presets pin a generator if you need one pinned. -Mo2Path below
+                    is the one deploy this script wires up; the preset that turns COPY_BUILD
+                    on instead ships in CMakeUserPresets.json.template.
       SF         -> clones rollingrock/sfse-template (raw SFSE hello-world, CMake)
       SkyrimNG   -> not scaffolded here; prints pointers (most Skyrim devs already have a
                     CommonLibSSE-NG flow; see docs/GAME_MATRIX.md)
+
+    -Name names the repo and its folder. Everything INSIDE the scaffold is named after
+    ($Name -replace '-','_').ToLowerInvariant() instead, because a CMake project name, a DLL
+    name, a log name and a TOML group all want a C identifier -- so -Name my-cool-mod produces
+    buildvr\Release\my_cool_mod.dll and my_cool_mod.log. vcpkg.json is the one exception the
+    other way: manifest names forbid underscores, so it takes the hyphenated form.
 
 .EXAMPLE
     .\New-Plugin.ps1 -Name my-cool-mod -Game F4VR -Mo2Path "C:\MO2\Fallout4VR\mods\my-cool-mod"
@@ -405,9 +415,10 @@ instance-mode MO2 keeps it under %LOCALAPPDATA%\ModOrganizer\<game>\mods).
         Write-Host 'NOTE (flat F4): use the flat preset instead of the VR one above:'
         Write-Host '  cmake --preset windows-vcpkg'
         Write-Host '  cmake --build build --config Release'
-        Write-Host 'That sets BUILD_FALLOUTVR=OFF, so it deploys to the flat install and builds into'
-        Write-Host 'build/ rather than buildvr/. The DLL itself is identical either way -- CommonLibF4'
-        Write-Host 'picks the runtime at load time, so one build already works on F4, NG and VR.'
+        Write-Host 'That sets BUILD_FALLOUTVR=OFF, so it builds into build/ rather than buildvr/ and aims a'
+        Write-Host 'deploy, if you ever enable one, at the flat install -- neither preset deploys by itself.'
+        Write-Host 'The DLL is identical either way: CommonLibF4 picks the runtime at load time, so one build'
+        Write-Host 'already works on F4, NG and VR.'
     }
 }
 elseif ($Game -eq 'SF') {

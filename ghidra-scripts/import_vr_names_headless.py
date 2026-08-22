@@ -26,10 +26,11 @@ USAGE
       --project-name BethesdaGhidraScripts \
       --program      /f4/vr/Fallout4VR.exe.unpacked.exe \
       --csv          C:\\repos\\vr_address_tools\\fallout_vr_address_library\\fo4_database.csv \
-      [--min-status 3] [--dry-run]
+      [--min-status 3] [--dry-run] [--replace-slot-names]
 
-Only functions still carrying Ghidra's `FUN_`/`sub_` placeholder are renamed, and anything
-already USER_DEFINED or IMPORTED is left alone -- so this composes with the RTTI vtable walk
+Only functions still carrying Ghidra's `FUN_`/`sub_` placeholder are renamed -- plus, with
+--replace-slot-names, the `Func42` vtable-slot placeholders the RTTI walk leaves behind --
+and anything already USER_DEFINED or IMPORTED is left alone. So this composes with that walk
 rather than fighting it, in either order.
 
 The CSV's addresses are absolute VAs against the binary's default image base, so they are

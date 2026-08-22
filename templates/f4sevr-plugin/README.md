@@ -11,12 +11,23 @@ cmake --preset windows-vcpkg-vr
 cmake --build buildvr --config Release
 ```
 
-DLL lands in `buildvr/Release/`. To auto-deploy every build into an MO2 mod folder, copy
-`CMakeUserPresets.json.template` to `CMakeUserPresets.json`, edit `MO2_INSTALL_PATH`, and configure
-with `cmake --preset vr-mo2` instead.
+DLL lands in `buildvr/Release/`, and nowhere else: `windows-vcpkg-vr` chooses the build directory
+and, if a deploy is enabled, which install it would target — it does not enable one.
 
-Prerequisites (see the starter pack's `setup/` scripts): VS2022 + C++ workload, CMake, vcpkg with
-**both** `VCPKG_ROOT` and `VCPKG_INSTALLATION_ROOT` set.
+To auto-deploy every build into an MO2 mod folder, copy `CMakeUserPresets.json.template` to
+`CMakeUserPresets.json`, point `MO2_INSTALL_PATH` at `<mo2>/mods/<yourmod>/F4SE/Plugins`, and
+configure with `cmake --preset vr-mo2` instead. (`New-Plugin.ps1 -Mo2Path` writes that file for
+you.) That path is checked at configure time, and the configure **fails** when the `mods` folder
+above it does not already exist — which the placeholder this template ships with,
+`C:/MO2/Fallout4VR/mods/starterplugin/F4SE/Plugins`, does not on nearly every machine.
+The refusal is the point: `cmake -E make_directory` deep-creates whatever path it is handed, so a
+typo — or an instance-mode MO2, whose mods live under `%LOCALAPPDATA%/ModOrganizer/<game>/mods` —
+used to build green with the DLL sitting in a tree no MO2 instance ever reads. MO2 > Settings >
+Paths shows the mods folder yours really uses.
+
+Prerequisites (see the starter pack's `setup/` scripts): VS2022 or newer with the Desktop
+development with C++ workload, CMake, vcpkg with **both** `VCPKG_ROOT` and
+`VCPKG_INSTALLATION_ROOT` set.
 
 ## Layout
 

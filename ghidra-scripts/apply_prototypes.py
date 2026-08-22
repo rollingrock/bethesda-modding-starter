@@ -23,8 +23,10 @@ WHY THIS IS NOT A ONE-LINER -- a demangled C++ name is missing two things:
      `inferred == args` is genuinely ambiguous (static, or instance with an unused arg).
      Measured on a 150-function sample: 67% decisive, 26% ambiguous. We skip the ambiguous.
 
-  2. The return type. Nowhere in the data. Writing `void` would DESTROY the decompiler's
-     own inference, so we emit `undefined8` -- Ghidra's honest "unknown 8 bytes".
+  2. The return type. Nowhere in the data -- and applying a prototype REPLACES whatever the
+     decompiler had inferred, so writing `void`, or a hardcoded `undefined8`, destroys it.
+     The probe reads the current return type out of the decompiled signature and puts it
+     back unchanged; `undefined8` is the fallback only where there was nothing to preserve.
 
 Phases (each cached, so you pay the slow one once):
 
@@ -36,7 +38,9 @@ Phases (each cached, so you pay the slow one once):
     apply    validate then set, journalling every outcome            (~50 ms/function)
 
 Dry-run is the default. `apply` requires --apply, and even then validates every prototype
-against Ghidra's own parser first.
+against Ghidra's own parser first -- which is a filter, not a prediction: the two endpoints
+resolve types by different paths, so a prototype that validates can still be rejected on
+apply. The APPLIED count is the one that says what reached the database.
 
 A plan is bound to the program it was built from and will not be applied to a different one.
 The server serves whatever project setup\\36-ghidra-mcp.ps1 last loaded, and an address means

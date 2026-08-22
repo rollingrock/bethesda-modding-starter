@@ -4,10 +4,13 @@
 > function signatures headlessly and is the main pipeline — see `../docs/GHIDRA_WORKFLOW.md`.
 > But it is **not** a superset of what is here. For **Fallout 4 VR specifically** it has no
 > address-library function symbols at all and names VR by porting byte signatures from a flat
-> build, so a VR-only machine gets almost nothing from it. The address-library import below is
-> not a fallback in that case — it is the primary source of real VR function names.
+> build, so a VR-only machine gets almost nothing from it. The address-library import is not a
+> fallback in that case — it is the primary source of real VR function names.
 >
-> Measured on F4VR 1.2.72, no flat Fallout 4 staged:
+> Measured 2026-08-16 on F4VR 1.2.72, no flat Fallout 4 staged. The denominator moves as
+> analysis runs — BGS's improve pass alone creates ~16,000 functions
+> (`setup\35-ghidra-analysis.ps1` records 201,005 → 216,903 across it) — so a function count
+> quoted elsewhere in this pack is not this one.
 >
 > | Step | Named functions (of 216,891) |
 > |---|---|
@@ -17,38 +20,66 @@
 >
 > The two sources are near-disjoint (only 1 collision across 26,411 applies), so run both.
 
-## ImportAddressLibrary.py (fallback)
+## `import_vr_names_headless.py` — the names, unattended
 
-Bulk-imports function names/labels from a VR Address Library CSV into the current Ghidra
-program. Works on **both** games' CSVs — the script reads the `vr`, `status` and `name`
-columns, which are common to:
+Applies a VR Address Library CSV to a program inside a Ghidra project under pyghidra. No GUI,
+no Jython extension, no flat Fallout 4 binary, so an agent can run it unattended. Its
+arguments, its image-base handling and its exit codes are in the script's own docstring —
+`--help` prints it.
+
+Where it goes in the sequence:
+
+- **After `setup\35-ghidra-analysis.ps1` has created functions.** This renames functions that
+  already exist; it creates none. Run it first and every CSV address lands on nothing — which
+  is the case it now exits **1** on, rather than the 0 an agent walks straight past.
+- **After the RTTI vtable walk (BGS menu 9), if you want `--replace-slot-names`.** Before that
+  walk there are no `Func42` placeholders to replace and the flag changes nothing; the script
+  says so in its summary rather than leaving you to infer it from a zero.
+- **`--dry-run` is a usable pre-flight gate**, not just a preview: it exits 1 on the same
+  "not one CSV address resolved to a function" condition the real run does, so a script can
+  gate on it before committing to the real one.
+
+## `ImportAddressLibrary.py` — the Script Manager fallback (Jython)
+
+The same CSVs, from Ghidra's GUI, for a machine where pyghidra is not available. It reads the
+`vr`, `status` and `name` columns, which both games' databases carry:
 
 - Skyrim VR: `vr_address_tools/skyrim_vr_address_library/database.csv` (~17K names)
-- Fallout 4 VR: `vr_address_tools/fallout_vr_address_library/fo4_database.csv` —
-  **93,858 rows, every one carrying both a VR address and a demangled C++ signature;
-  46,348 of them at `status >= 3`.** (An earlier version of this file called F4VR coverage
-  "much smaller". Measured, it is the single best source of VR function names there is, and
-  it needs no flat Fallout 4 binary — see `import_vr_names_headless.py` below.)
+- Fallout 4 VR: `vr_address_tools/fallout_vr_address_library/fo4_database.csv` — **93,858 rows,
+  every one carrying a VR address and a demangled C++ name; 46,348 at `status >= 3`, of which
+  29,580 carry an argument list** (counted off the CSV, 2026-08-22). The other rows name
+  vtables, RTTI objects and static instances — real symbols, but nothing `apply_prototypes.py`
+  can parse a signature out of. An earlier version of this file called F4VR coverage "much
+  smaller". Measured, it is the single best source of VR function names there is, and it needs
+  no flat Fallout 4 binary.
 
-It prompts for the CSV (the built-in default points at the Skyrim path under `C:\repos`).
-Only entries with `status >= 3` (high confidence) are applied.
-
-### Requirements
+Two things it needs:
 
 - **The Jython extension.** Ghidra 12.x ships Jython as an *optional* extension and this
   script declares `@runtime Jython`. Install it once via `File > Install Extensions`
   (it's bundled with the Ghidra distribution) and restart — otherwise the Script Manager
   refuses to run the script.
-- Run it from the Script Manager (`Window > Script Manager`) with your game program open
-  **after auto-analysis has completed**.
+- **Your game program open, after auto-analysis has completed.** Note that unlike the headless
+  importer this one will *create* a function at an address that has none, if you answer Yes to
+  its "Create function definitions?" prompt.
+
+And one thing it costs you, which is not obvious from the summary it prints:
+
+> **It strips the signature.** `parse_name` cuts each name at the first `(` and keeps namespace
+> + leaf, and the symbol sanitiser would replace `(`, `&`, `*` and `,` anyway — so
+> `Allocate(NiPoint3&,TESObjectCELL*,...)` lands on the function as `Allocate`.
+> `apply_prototypes.py` below skips any name without a `(`, so a program named **only** by this
+> script produces zero candidates: `probing 0 of 0 candidates`, `plan written … (0 prototypes)`,
+> and no console line explains why. If you want prototypes, the names have to come from
+> `import_vr_names_headless.py` or from the BGS pipeline.
 
 ## `apply_prototypes.py` — turn the signature in a NAME into an applied prototype
 
-The name import above sets names only, so the decompiler still shows
-`(undefined4 *param_1, longlong param_2, ...)` even though the name says
-`Allocate(NiPoint3&,TESObjectCELL*,TESWorldSpace*,float,float)`. This parses those names
-and applies them with `/set_function_prototype`. It talks HTTP to the **headless** MCP
-server (`setup/36-ghidra-mcp.ps1 -Start`); no pyghidra, no GUI.
+The pipeline's names — and `import_vr_names_headless.py`'s — carry the full signature but set
+names only, so the decompiler still shows `(undefined4 *param_1, longlong param_2, ...)` even
+though the name says `Allocate(NiPoint3&,TESObjectCELL*,TESWorldSpace*,float,float)`. This
+parses those names and applies them with `/set_function_prototype`. It talks HTTP to the
+**headless** MCP server (`setup\36-ghidra-mcp.ps1 -Start`); no pyghidra, no GUI.
 
 ```powershell
 python apply_prototypes.py fetch                       # ~20 s
@@ -58,8 +89,25 @@ python apply_prototypes.py apply                       # DRY RUN: validates, wri
 python apply_prototypes.py apply --tier 1 --apply      # commits
 ```
 
+The remaining flags are in the script's docstring and `--help`.
+
 **Back up the project first.** This writes to a database that took hours to build. Every
-applied change is journalled to `.proto-cache/journal.jsonl`.
+outcome of an `--apply` run — applied, rejected on apply, invalid, error on validate, stale
+row, unknown — is journalled to `.proto-cache/journal.jsonl` and flushed per line, because that
+file is the only record of what reached the database. A dry run journals nothing.
+
+**A plan is bound to the program it was built from**, and `apply` refuses one built against a
+different program — including a dry run, since a validation report about the wrong program is
+worse than none. The server serves whatever `36-ghidra-mcp.ps1` last loaded, and
+`/set_function_prototype` takes an *address*: a plan applied to the wrong program writes 13,108
+prototypes at addresses that mean something else there, and the server reports every one of
+them as applied.
+
+**After a failure, the two recoveries are not the same one.** `--retry-failed` re-applies only
+what the journal *records* as not applied — the recovery after fixing a type mapping or a
+this-detection rule. It deliberately does not pick up rows that appear in no journal line at
+all, which is exactly what an interrupted run leaves behind; a plain `apply --apply` sweeps
+those up (re-applying a row that already succeeded is idempotent, it just costs ~250 ms).
 
 ### Measured on F4VR (2026-08-16)
 
@@ -74,17 +122,29 @@ applied change is journalled to `.proto-cache/journal.jsonl`.
 | &nbsp;&nbsp;no argument type resolves | 5,571 |
 | &nbsp;&nbsp;inferred arity exceeds args+1 | 1,155 |
 
-**13,108 prototypes planned; all 13,108 validated by Ghidra's own parser, 0 rejected.**
-Of those, 4,176 get a typed `this`, 8,689 get `void * this` (the class type does not exist),
-and 243 are free functions with no `this` at all.
+**13,108 prototypes planned; all 13,108 validated by Ghidra's own parser, 0 rejected at
+validation.** Of those, 4,176 get a typed `this`, 8,689 get `void * this` (the class type does
+not exist), and 243 are free functions with no `this` at all.
+
+**Validating is not applying, and that gap is 15.5% wide.** The two endpoints resolve types by
+different paths: on the same 13,108-row plan, `/validate_function_prototype` answered
+`valid` for **2,027 prototypes that `/set_function_prototype` then rejected** with "Can't
+resolve datatype". **1,904 of those 2,027 were `bool` or `bool *`** — the very type Ghidra's own
+decompiler infers — because importing CommonLibF4 created a second definition of it, so the
+program holds both `/bool` and `/CommonLibF4/bool` and the parser refuses to guess between
+them. `report` now composes those types as unambiguous equivalents instead (`bool` →
+`undefined1`, which leaves the decompiler free to recover bool-ness itself), `apply` counts
+what *applied* rather than what validated, and every rejection is journalled with its reason.
+Read the APPLIED line, not the validated one.
 
 `void * this` is still worth having: it marks the this-pointer so every *other* parameter
 lands in the right position, which is where most of the value is. It just gives no field
 access on `this` itself.
 
-The probe costs ~350 ms/function — the decompiler, not HTTP — so about 100 minutes for the
-full corpus on this machine. It is resumable, and `--from-plan` re-probes only what a plan
-already contains.
+The probe costs ~350 ms/function on this machine — the decompiler, not HTTP — which is ~150
+minutes for all 25,867. It is resumable and safe to interrupt, and it prints that estimate for
+whatever subset it is about to probe; `--from-plan` narrows it to the addresses a plan already
+contains.
 
 ### Why it is more than a string substitution
 
@@ -97,8 +157,12 @@ A demangled C++ name is missing two things, and both will bite:
   Ghidra's decompiler arity, which can undercount but never overcount, so `inferred ==
   args+1` proves a `this` and `inferred == args` is genuinely ambiguous. Measured on 150
   functions: **67% decisive, 26% ambiguous**. The ambiguous ones are skipped, not guessed.
-- **No return type.** Emitting `void` would destroy the decompiler's own inference, so
-  every prototype returns `undefined8` — Ghidra's honest "unknown 8 bytes".
+- **No return type.** Emitting `void` would destroy the decompiler's own inference — and so
+  would a hardcoded `undefined8`, which is what this script used to write. Applying a prototype
+  *replaces* the return type, so functions Ghidra had already worked out as `bool`,
+  `longlong *` or `undefined1 *` were being downgraded to "unknown 8 bytes" wholesale. The
+  probe now reads the current return type out of the decompiled signature and puts it back
+  unchanged; `undefined8` appears only where the decompiler offered nothing to preserve.
 
 ### Most of the type inventory is unusable, which is the real limit
 

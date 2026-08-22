@@ -51,12 +51,18 @@ tool 'inspect' failed [504]: main-thread task did not run within 5000ms and the 
 counter has not advanced -- main thread hung or the game is fully paused
 ```
 
-So: connect whenever you like, but load a save before expecting `inspect`, `console`,
-`rendertarget` or `measure` to answer.
+So: connect whenever you like, but load a save before expecting `console`, `rendertarget`,
+`measure` or most of `inspect` to answer.
+
+**Two probes are deliberately exempt**, because a diagnostic that goes silent exactly when the
+game is stuck is worthless: `inspect kind='health'` and `inspect kind='ui'` are answered
+*without* the main thread — `ui` reads the engine's own menu map under its read lock. Those are
+what you ask when everything else 504s, and `ui` is how you find the modal that is holding the
+main thread (and, since 2026-08-17, `menu accept` is how you dismiss it without a headset).
 
 ```powershell
 irm http://127.0.0.1:8930/api/health      # 8931 for VR — proves load, identity, frame counter
-irm http://127.0.0.1:8930/api/tools       # the tool catalogue (7 tools on Fallout 4 today)
+irm http://127.0.0.1:8930/api/tools       # the tool catalogue — the live list, not this doc
 irm http://127.0.0.1:8930/api/tool/rendertarget -Method Post -ContentType application/json -Body '{"action":"list"}'
 ```
 
@@ -66,14 +72,25 @@ catalogue is `/api/tools`.
 
 ## Registering your own tools from your mod
 
-`include/DevBenchAPI.h` is a cross-plugin C-ABI (MIT-licensed so closed-source mods can use
-it): after `kPostLoad`, `GetDevBenchInterface001()->RegisterTool("yourmod.dothing", schema,
-handler, ctx)`. Ships as a vcpkg overlay port in `cmake/ports/devbench-api/`.
+`include/DevBenchAPI.h` **and `DevBenchAPI.cpp`** are a cross-plugin C-ABI, MIT-licensed
+separately from devbench's GPL-3.0 so closed-source mods can vendor them. Vendor *both*: the
+header is plain C++ and game-neutral on purpose, and the `.cpp` is the only extender-aware
+part — it is what picks SKSE or F4SE at compile time. Then
+`GetDevBenchInterface001()->RegisterTool("yourmod.dothing", descriptorJson, handler, ctx)`.
+Ships as a vcpkg overlay port in `cmake/ports/devbench-api/`.
+
+**Ask for the interface at `kPostPostLoad` on Fallout** — not `kPostLoad`. F4SE runs every
+plugin's `kPostLoad` handler in plugin *load order* and devbench sets itself up in its own, so
+a consumer sorting before devbench asks before the provider exists and gets `nullptr`. (On
+Skyrim: `kDataLoaded`.) `nullptr` is never an error — devbench is a development dependency and
+must never become a load-order requirement — so retry at a later message. The header states
+the whole contract, including which ABI revision each vtable slot needs; read it there.
 
 ## State (2026-08-16) — the Fallout 4 target is live-verified
 
-Run on a real FO4VR 1.2.72 install under MO2, headless via SteamVR's null driver. All seven
-tools answered:
+Run on a real FO4VR 1.2.72 install under MO2, headless via SteamVR's null driver. Every one of
+the seven tools that existed that day answered. (`menu` — detect and answer a blocking modal —
+landed the next day in devbench `280348e`, making eight; it has not been through this run.)
 
 | check | result |
 |---|---|
@@ -91,11 +108,6 @@ a stereo 3024x1680 in the right HDR format is that check passing. The log record
 
 Still open:
 
-- `DevBenchAPI.h` is still **Skyrim-typed** (includes `<RE/Skyrim.h>`) — a Fallout mod cannot
-  register its own tools until the discovery handshake is made game-neutral.
-- A consumer must ask for the interface at **`kPostPostLoad` on Fallout** (not `kPostLoad`:
-  F4SE runs `kPostLoad` handlers in plugin load order, so a consumer sorting before devbench
-  would ask before the provider exists).
 - Nobody has played this in a headset; every run has been headless.
 - The pytest suite (`tests/http/`) auto-discovers **Skyrim ports only** — for Fallout set
   `$env:DEVBENCH_URL = "http://127.0.0.1:8930"` explicitly; expect Skyrim-only tools to skip.

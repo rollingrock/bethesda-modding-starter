@@ -14,11 +14,13 @@ GUI (only when you want to LOOK at the disassembly)
 Claude Code ─stdio─> bridge-mcp-ghidra.exe ─HTTP :8089─> GhidraMCP extension (inside the Ghidra GUI)
 ```
 
-`setup/36-ghidra-mcp.ps1 -Start` runs the headless one. Measured on a clean machine: up in
-~5 s, 226 REST endpoints, bridge registers 225 MCP tools. It is a `GhidraLaunchable`, not a
-fat jar — `java -jar` cannot work, because the build deliberately leaves the Ghidra jars out
-("provided by Ghidra at runtime"). The launcher builds a ~194-jar classpath into a java
-`@argfile`; `30-ghidra.ps1` writes it.
+`setup/36-ghidra-mcp.ps1 -Start` runs the headless one; its header carries the measured
+startup time, endpoint count and registered-tool count, stamped with the Ghidra and ghidra-mcp
+versions they were measured against. It is a `GhidraLaunchable`, not a fat jar — `java -jar`
+cannot work, because the build deliberately leaves the Ghidra jars out ("provided by Ghidra at
+runtime"). The launcher needs the install's whole jar set on the classpath, which is why
+`30-ghidra.ps1` writes it into a java `@argfile` rather than a command line that would run at
+Windows' 32 KB limit.
 
 ## Connecting
 
@@ -42,11 +44,11 @@ connect_instance("<your project>")
 list_open_programs()
 ```
 
-Before `connect_instance`, only ~30 static tools exist; the ~200 analysis tools register on
-connect. **If `decompile_function` "doesn't exist", you skipped the connect.** With more than
-one Ghidra on the machine, an un-connected bridge can silently read the WRONG binary and
-return confident nonsense. If one instance has several programs open, pass `program=` on
-every call (or set `GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS=1`).
+Before `connect_instance`, only a small set of static tools exists; the analysis tools — the
+ones you came for — register on connect. **If `decompile_function` "doesn't exist", you skipped
+the connect.** With more than one Ghidra on the machine, an un-connected bridge can silently
+read the WRONG binary and return confident nonsense. If one instance has several programs open,
+pass `program=` on every call (or set `GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS=1`).
 
 The GUI plugin starts its HTTP server automatically when the plugin loads — but it only loads
 if `FrontEndTool.xml` names it, and `gradlew deploy`'s patch step can't create that file. It
@@ -72,8 +74,11 @@ open `<name>.lock~` exclusively* — `Test-GhidraProjectLocked` in `setup/_commo
 rather than fighting. It will break a **provably** stale `<name>.lock` (nothing holds
 `.lock~` *and* the lock names this host) so a crashed run doesn't need a human to delete a
 file nothing owns — but it never touches `.lock~`. And `-Stop` shuts down over HTTP
-(`/save_all_programs`, then `/exit_ghidra`) rather than killing the JVM, because a killed JVM
-is what leaves the stale lock in the first place.
+(`/save_all_programs`, then `/exit_ghidra`) before anything else, because a killed JVM is what
+leaves the stale lock in the first place. It escalates to a force-terminate only after that
+save, only after a 20 s grace, and only against a process whose recorded PID *and* start time
+still identify the java it launched itself — a server it cannot claim is never killed, only
+asked to exit.
 
 Note `/list_project_files` does **not** work headless — it answers *"Project listing requires
 GUI mode (PluginTool not available)"*, the same GUI-only family as `/mcp/instance_info` and
@@ -82,9 +87,10 @@ the non-existent `/server_status`. Use the pipeline's import layout for program 
 
 ## Starting the server is fast; you are not re-analysing anything
 
-Cold start with the full F4VR program (227,212 functions) opened from the project: **7.9 s**.
-A decompile round-trip after that is ~0.3 s. There is no "wait for it to load" phase to plan
-around — start it when you need it and stop it when you don't.
+Cold start with the full F4VR program opened from the project: **7.9 s**, and a decompile
+round-trip after that ~0.3 s (measured 2026-08-16, on the 227,212-function F4VR corpus). There
+is no "wait for it to load" phase to plan around — start it when you need it and stop it when
+you don't.
 
 The hours are all in **Phase 4's one-time analysis** (`35-ghidra-analysis.ps1`), which writes
 the database. `-Start -Project/-Program` only *opens* that database. The one exception is
@@ -92,14 +98,15 @@ the database. `-Start -Project/-Program` only *opens* that database. The one exc
 DLL, wrong for a game EXE (stage those into the pipeline instead).
 
 Note the HTTP port is opened **after** the initial load, so a slow import is indistinguishable
-from a hang until it finishes; that is what `-TimeoutSec` is for (default 180 s, ~20x the
-measured project-open cost).
+from a hang until it finishes; that is what `-TimeoutSec` is for, and its default is a large
+multiple of the project-open cost above rather than a guess.
 
 ## `limit` is not honoured by the listing endpoints — this will blow up your context
 
-`GET /list_functions?limit=40` against F4VR returns **all 227,212 functions**: 12.2 MB, 19
-seconds. The parameter is accepted and ignored. Never pipe a listing endpoint straight into
-a session; write it to a file and filter there, or use a targeted lookup
+`GET /list_functions?limit=40` against F4VR returns **every function in the program**: 12.2 MB
+and 19 seconds for that 227,212-function corpus (measured 2026-08-16). The parameter is
+accepted and ignored. Never pipe a listing endpoint straight into a session; write it to a
+file and filter there, or use a targeted lookup
 (`decompile_function?address=…`) instead. The response shape is
 `{"functions":[{name,address}],"count":N}` — note `functions`/`count`, not the `{"data":…}`
 envelope other endpoints use, and `/mcp/schema` uses `{"tools":[…],"count":N}` again. Check
@@ -111,10 +118,11 @@ The GhidraMCP extension only loads in the exact Ghidra version it was built for
 (`extension.properties` version == Ghidra's `application.version`). `setup/30-ghidra.ps1`
 builds **against whatever install you actually have** (`gradlew -PGHIDRA_INSTALL_DIR=…`, which
 stamps the version at `processResources` time) and then re-reads the stamp out of the built
-zip to prove it matches before deploying. Note ghidra-mcp's `pom.xml` names a different
-version (12.1.2 at time of writing) — that is only a default, and `gradlew verifyVersion` will
-fail on the mismatch even though the build itself is fine. If you upgrade Ghidra, re-run
-`30-ghidra.ps1`.
+zip to prove it matches before deploying. Note ghidra-mcp's `pom.xml` pins a Ghidra version of
+its own, which is usually **not** the one you have (checked 2026-08-22: `pom.xml` says 12.1.2,
+BethesdaGhidraScripts' managed install is 12.0.4) — that is only Maven's default, and
+`gradlew verifyVersion` throws on the mismatch even though the Gradle build itself is fine. If
+you upgrade Ghidra, re-run `30-ghidra.ps1`.
 Also: **never let a newer Ghidra upgrade an existing project unattended** — project upgrades
 are one-way and analysis databases for game binaries are hours of work to rebuild.
 
@@ -149,21 +157,32 @@ Starfield and FNV: it clang-parses the CommonLib headers and imports **type defi
 layouts, function signatures and address-library names** — for the VR binaries it parses
 CommonLibVR/CommonLibF4VR with the VR defines set, giving true VR struct layouts.
 
+**Drive it with `35-ghidra-analysis.ps1`, not with its menu.** Stage your game EXE(s) into
+`C:\repos\BethesdaGhidraScripts\exes\<game>\<ver>\` (see its README for the exact paths), then:
+
 ```powershell
-cd C:\repos\BethesdaGhidraScripts
-# drop your game EXE(s) into exes\<game>\<ver>\ (see its README for the exact paths)
-python run.py     # menu: 1 (install prereqs incl. its own pinned Ghidra), 2 (submodules),
-                  #       7 (full rebuild — generates importers + headless imports everything)
+.\setup\35-ghidra-analysis.ps1 -CheckOnly    # instant; answers "does Ghidra need to run?"
+.\setup\35-ghidra-analysis.ps1               # hours. run it detached, do not interrupt it
 ```
 
-Auto-analysis takes hours per Bethesda binary; let it finish. Afterwards:
+That script calls `run.py`'s subcommands (`setup` = menu 1+2, `build` = menu 7), scopes the run
+to one game if you ask it to, records a per-(game, version) verdict, and **exports the symbols
+itself** — a `.dd64` x64dbg database, a `.map` and a `.symbols.json`, produced by BGS's own
+`scripts/core/symbol_export.py`. That export is what Phase 5 (x64dbg) consumes, and it is not
+an optional extra afterwards. **Do not re-derive where it landed:** the run records the
+directory each export actually wrote to as `exportDir` in `.analysis-verified.json`, and that
+record is what `40-x64dbg.ps1` reads.
+
+Auto-analysis takes hours per Bethesda binary; let it finish. The menu numbers are still worth
+knowing for the things you would drive by hand:
 
 - Menu **6** opens Ghidra with the enriched project.
 - Menu **9** improves an EXISTING project of yours (exact CommonLib importer → generic
   RTTI-walk vtable naming → name reconciler) — it only renames `FUN_*` placeholders and
-  leaves hand-typed names alone.
-- Menu **10** exports symbols as JSON / .map / **x64dbg database** / a synthetic **PDB** —
-  feed the x64dbg export to the x64dbg MCP setup so live debugging shows real names.
+  leaves hand-typed names alone. This is the one step `35` still drives through the menu,
+  because it is the one with no subcommand.
+- Menu **10** wraps the same `symbol_export.py` behind prompts, and can additionally emit a
+  synthetic PDB — which `35`'s export does not ask for.
 
 `setup/30-ghidra.ps1` builds the GhidraMCP extension **against BGS's managed Ghidra**
 (`tools/ghidra` inside the repo) when present, so one Ghidra serves both the pipeline and the
@@ -190,5 +209,13 @@ So the pack defaults to 1001Bits, and **for Fallout 4 VR that is not a preferenc
 requirement** — the other fork cannot emit true-VR layouts. Worth re-checking alandtse before
 deep *Skyrim VR type* work, where its enrichment fixes are the newer ones.
 
-The single-file `../ghidra-scripts/ImportAddressLibrary.py` remains as a minimal fallback
-(names only, needs the Jython extension) for when you don't want the full pipeline.
+**For Fallout 4 VR the pipeline is not the whole story.** BGS names VR functions by porting
+byte signatures from a flat Fallout 4 build, so a VR-only machine gets the types and almost
+none of the names. Those names already exist, precomputed, in the VR address library, and
+`../ghidra-scripts/import_vr_names_headless.py` applies them unattended under pyghidra — on
+F4VR that is the primary source of real function names, not a fallback. `../ghidra-scripts/`
+has its own README with the measured coverage; read it before deciding you are done after 35.
+
+The single-file `ImportAddressLibrary.py` beside it does a narrower version of the same job
+from the Ghidra GUI's Script Manager, and needs the optional Jython extension installed by
+hand. That one is the fallback.

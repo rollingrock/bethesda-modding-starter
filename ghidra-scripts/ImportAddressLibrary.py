@@ -7,15 +7,17 @@
 # @runtime Jython
 
 """
-Skyrim VR Address Library Importer for Ghidra
+VR Address Library Importer for Ghidra
 
-This script imports function names and symbols from the Skyrim VR Address Library
-(database.csv) into the current Ghidra program.
+This script imports function names and symbols from a VR Address Library CSV into the
+current Ghidra program. It reads the 'vr', 'status' and 'name' columns, which both games'
+databases carry, so it works on Skyrim VR's database.csv and Fallout 4 VR's fo4_database.csv
+alike; only the built-in default path offered by the prompt is the Skyrim one.
 
 Usage:
-1. Open SkyrimVR.exe in Ghidra and run auto-analysis
+1. Open the game program in Ghidra and run auto-analysis
 2. Run this script from the Script Manager (Window -> Script Manager)
-3. Select the database.csv file when prompted (or use default)
+3. Select the CSV file when prompted (or use default)
 4. Wait for import to complete
 
 The script will:
@@ -23,6 +25,16 @@ The script will:
 - Create function definitions where appropriate
 - Apply namespaces based on class names (e.g., Actor::StealAlarm -> Actor namespace)
 - Track statistics on successful/failed imports
+
+WHAT ARRIVES ON THE FUNCTION IS A NAME, NOT A SIGNATURE
+-------------------------------------------------------
+parse_name cuts each CSV name at the first '(' and keeps namespace + leaf, and
+sanitize_symbol_name would replace '(', '&', '*' and ',' anyway -- so
+'Allocate(NiPoint3&,TESObjectCELL*,...)' is applied as 'Allocate'. That is fine for reading
+the listing and useless downstream: apply_prototypes.py skips any name without a '(', so a
+program named only by this script hands it zero candidates and reports 'probing 0 of 0'
+with nothing to explain why. import_vr_names_headless.py applies the raw CSV name instead,
+signature and all, and is the path to use when the prototypes matter.
 
 WHAT THE SUMMARY IS ALLOWED TO SAY
 ----------------------------------

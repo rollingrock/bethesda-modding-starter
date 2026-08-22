@@ -16,13 +16,23 @@ diverging from the defaults.
    MO2 (and its path) — you need this for deploy wiring.
 3. `winget --version` must work. If not, stop and have the user install "App Installer".
 4. Shell: every script here is **Windows PowerShell 5.1**-clean, so you can run them from the
-   stock Windows shell (which is also what Claude Code uses on Windows) — you do not need
-   pwsh 7 first. That constraint is not cosmetic: `00-prereqs.ps1` is what *installs* pwsh 7,
-   so if it needed pwsh 7 the runbook could never start. If you edit a script, keep it 5.1-safe
-   — no `?:` ternary, no `??` — and save it as UTF-8 **with BOM**. Without a BOM, 5.1 decodes
-   the file as CP1252 and an em dash (`—`) becomes `â€”`, whose last character is U+201D, which
-   PowerShell treats as a quote; the file then fails to parse with a misleading error pointing
-   at some unrelated line. CI enforces both rules (`.github/workflows/ps-compat.yml`).
+   stock Windows shell (which is also what Claude Code uses on Windows). Nothing here installs
+   pwsh 7 and nothing here needs it — `00-prereqs.ps1` lists PowerShell 7 under "Not required,
+   deliberately" for exactly that reason: a runbook whose first script needed pwsh 7 could
+   never start on the machine it targets. If you edit a script, keep it 5.1-safe — no `?:`
+   ternary, no `??` — and save it as UTF-8 **with BOM**. Without a BOM, 5.1 decodes the file as
+   CP1252 and an em dash (`—`) becomes `â€”`, whose last character is U+201D, which PowerShell
+   treats as a quote; the file then fails to parse with a misleading error pointing at some
+   unrelated line. CI enforces both rules (`.github/workflows/ps-compat.yml`).
+5. **One home per fact.** A script's own header is authoritative for its flags, its sizes, its
+   paths and its exit codes. This file and the READMEs carry what only they can know — the
+   sequence, the gates, the traps, and measurements with the date they were taken — and stop
+   restating what a script already owns. When you change a script, grep the docs for the old
+   claim and *delete* it rather than restate it: a fact that lives in one place cannot drift.
+   This is not tidiness. A doc that confidently states something false is worse than one that
+   says nothing, because a reader trusts it over a directory listing — this pack shipped a
+   documented symbols path that pointed at two different wrong places, and a "300 MB" clone the
+   script itself calls 1.1 GB.
 
 ## Phase 1 — toolchain
 
@@ -45,11 +55,16 @@ cloning a second copy and repointing a machine-wide variable other projects reso
 Pass `-VcpkgDir` only when you actually want a particular location; an explicit one always
 wins over adoption.
 
-**Exit codes across the numbered scripts.** `0` = the state you asked for now holds. `2` =
-nothing failed, but work is pending — what `-CheckOnly` reports when there is something to do
-(`35-ghidra-analysis.ps1` is the reference). `1` = a real failure. A script exits `0` only when
-it has *verified* the outcome, never merely because its last line ran, so gate on the exit code
-— and read the message before re-running, because `1` is often a refusal rather than a flake.
+**Exit codes.** `0` = the state you asked for now holds. `1` = a real failure. `2` = nothing
+failed, but the state is not the one you asked for — work pending, or up-but-degraded. Only
+four scripts speak the third one: `20-repos.ps1`, `30-ghidra.ps1`, `35-ghidra-analysis.ps1` and
+`36-ghidra-mcp.ps1`. Three of them say what their own `2` means at the top of the file;
+`30-ghidra.ps1` does not — its only explanation is the refusal it prints (Phase 4, step 3).
+**`00-prereqs.ps1` and `10-vcpkg.ps1` answer 0/1 only** — their `-CheckOnly` reports "there is
+something to install" as `1`, so a caller that reads 1 as broken will misread a fresh machine.
+A script exits `0` only when it has *verified* the outcome, never merely because its last line
+ran, so gate on the exit code — and read the message before re-running, because `1` is often a
+refusal rather than a flake.
 
 **Every gate below is a script, not a file test.** A path existing proves something was
 created, never that it works: `python.exe` on a stock Windows box is a Store stub that exits
@@ -60,12 +75,20 @@ consumer does.
 ## Phase 2 — repos
 
 ```powershell
-.\setup\20-repos.ps1            # add -SkipAddressTools to defer the ~300 MB CSV clone
+.\setup\20-repos.ps1
 ```
+
+`-SkipAddressTools` defers the address-library clone, which is the big one; `-Only <names>`
+narrows the table to the repos you name. Both work in either mode, and the script's header
+carries the table, the sizes and which fork each row pins.
 
 **Gate:** `.\setup\20-repos.ps1 -CheckOnly` exits 0. A `.git` directory is not the gate: it
 proves something was cloned, not that it came from the URL this pack pins, and a wrong-fork or
-wrong-branch clone would otherwise stay blessed forever.
+wrong-branch clone would otherwise stay blessed forever. Exit 2 covers both reasons this gate
+can be unmet, and they want opposite responses: a repo that is simply **absent** is cleared by
+running the script without `-CheckOnly`, while a directory holding a **different repository** is
+reported and left exactly where it is — nothing is cloned into it and nothing is deleted, and no
+re-run clears it until a human moves it. Read which one it printed before acting.
 
 ## Phase 3 — first plugin build (the real proof)
 
@@ -77,7 +100,14 @@ cmake --build buildvr --config Release
 ```
 
 First configure restores ~13 vcpkg ports and compiles CommonLibF4 — several minutes; that is
-normal. **Gate:** `buildvr/Release/<name>.dll` exists.
+normal.
+
+**Gate:** `buildvr/Release/<token>.dll` exists, where `<token>` is `-Name` lowercased with
+every `-` turned into `_`. That transform is not cosmetic and it is the whole reason this gate
+is worth stating: `New-Plugin.ps1` renames the project, the DLL, the TOML and the log file
+after the token, so `-Name my-cool-mod` produces `my_cool_mod.dll` and a gate copied literally
+from `<name>` never matches. `90-verify.ps1` computes the same transform for its own
+`-BuildTest` row.
 
 This gate proves VS + C++23, CMake, vcpkg, git submodules and the whole chain at once —
 everything after it is additive.
@@ -86,13 +116,28 @@ everything after it is additive.
 which dispatches at runtime: `ENABLE_FALLOUT_F4`/`_NG`/`_VR` are all ON by default, so a
 single build serves pre-NG Fallout 4, the Next-Gen update **and** Fallout 4 VR, choosing via
 `REL::Module` at load time. There is no `FALLOUTVR` define to set. `BUILD_FALLOUTVR` only
-picks the deploy target and build directory (`buildvr/` vs `build/`). Gate your own
-runtime-specific code on `REL::Module::IsVR()` / `IsNG()` / `IsF4()`, not on a compile-time
-macro.
+chooses which install a deploy *would* target; the hidden `vr`/`flat` presets that set it also
+choose the build directory (`buildvr/` vs `build/`). Gate your own runtime-specific code on
+`REL::Module::IsVR()` / `IsNG()` / `IsF4()`, not on a compile-time macro.
+
+**Neither default preset deploys anything.** `COPY_BUILD` is FALSE unless you ask for it, and
+`windows-vcpkg-vr` / `windows-vcpkg` do not ask — a plain build leaves the DLL in its build
+directory and copies it nowhere. Deploying is a separate decision with two mechanisms:
+`MO2_INSTALL_PATH` (what `-Mo2Path` writes into `CMakeUserPresets.json` as the `vr-mo2`
+preset), or `COPY_BUILD` plus `FalloutVRPath`/`Fallout4Path`. Both now fail at *configure* when
+the target path is wrong, rather than building green into a tree nothing reads.
+
+**`-Mo2Path` is checked before anything is copied, and it throws.** Pass the mod's own folder
+(`<mo2>\mods\<yourmod>`), not the mods root, and the mods root above it must already exist —
+that directory is MO2's, and if it is missing the path is not pointing at an MO2 install. The
+mod folder itself not existing is fine; the first deploy creates it. Do not retry the throw,
+fix the path: MO2 > Settings > Paths shows the mods folder it really uses, and an
+instance-mode MO2 keeps it under `%LOCALAPPDATA%\ModOrganizer\<game>\mods`.
 
 **Visual Studio version:** `windows-vcpkg-vr` takes whatever VS is installed. VS2022 and
-VS2026 are both verified to build the full chain; `vs2019`/`vs2022`/`vs2026` presets exist if
-you need to pin one. (Historical note, in case you meet it in an old checkout: the previous
+VS2026 are both verified to build the full chain; `vs2026-windows-vcpkg-vr`,
+`vs2022-windows-vcpkg-vr` and `vs2022-windows-vcpkg` pin a generator if you need one; there is
+no vs2019 preset. (Historical note, in case you meet it in an old checkout: the previous
 submodule — rollingrock/CommonLibF4 — could not compile on MSVC 14.5x, because
 `hkVector4f& GetNormalized()` returned a reference to a local and C++23's P2266 makes a
 returned local an rvalue, giving ~14 `C2440` errors in `RE/Havok/hkVector4.h`. alandtse's
@@ -101,7 +146,8 @@ fork fixed that in `ba22620`.)
 To test in game: the DLL+PDB go in the mod's `F4SE/Plugins/` (automatic with the `vr-mo2`
 preset); copy the TOML from `Data/F4SE/Plugins/` next to it by hand. The game needs F4SEVR
 and the [VR Address Library](https://www.nexusmods.com/fallout4/mods/64879) installed. Check
-`Documents\My Games\Fallout4VR\F4SE\<name>.log` for the load banner.
+`Documents\My Games\Fallout4VR\F4SE\<token>.log` for the load banner — same token as the DLL,
+so a hyphenated `-Name` logs to the underscored file and not to the one you typed.
 
 ## Phase 4 — Ghidra: analysis database + MCP (RE layer)
 
@@ -117,25 +163,41 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    .\setup\35-ghidra-analysis.ps1                  # runs it; -OnlyGame f4 to scope
    ```
    **You can run this yourself — do not hand it back to the user.** BGS ships an interactive
-   menu, but the items this needs (1 prereqs, 2 submodules, 7 full rebuild) each run straight
-   through without prompting, and 7 discovers every staged binary on its own, so the script
-   drives them by feeding menu keys on stdin. Prompts only appear in the other submenus and on
-   failure-retry; `run.py` treats EOF as quit.
+   menu, but nothing this phase needs a human for: `run.py` has real subcommands for the main
+   path, and option 7 discovers every staged binary on its own. Prompts appear only in the
+   other submenus and on failure-retry, and `run.py` treats EOF as quit.
 
-   `-CheckOnly` answers "does Ghidra need to run for this game?" instantly and changes
-   nothing — exit 0 means nothing to do, exit 2 means work is pending. Use it before
-   committing to a run.
+   `-CheckOnly` answers "does Ghidra need to run for this game?" instantly — exit 0 means
+   nothing to do, exit 2 means work is pending. Use it before committing to a run. It changes
+   exactly one thing, deliberately: game binaries stranded under `.exes-held` by an interrupted
+   `-OnlyGame` run are moved back before the staging scan reads `exes\`, because otherwise
+   `-CheckOnly` would report "nothing to do" for a game whose un-redownloadable binary it had
+   just declined to reclaim.
 
-   **Use run.py's subcommands, not the menu.** `python run.py setup` (menu 1+2), `build`
-   (menu 7), `all`, `clean` are documented under "Non-interactive mode" and need no stdin at
-   all. Only the improve pass (menu 9) has no subcommand. `run clean` before rebuilding if the
-   project records a different importer stage, or stale names survive.
+   **Use run.py's subcommands, not the menu** — and this script already does. `python run.py
+   setup` (menu 1+2), `build` (menu 7), `all` and `clean` are documented under "Non-interactive
+   mode" and need no stdin at all; only the improve pass (menu 9) has no subcommand, and it is
+   the one place `35-ghidra-analysis.ps1` still feeds menu keys. `run clean` before rebuilding
+   if the project records a different importer stage, or stale names survive.
 
-   **Export the symbols when the analysis is done** — `scripts/core/symbol_export.py` is
-   scriptable (menu 10 wraps it) and is what makes Phase 5 work: it emits a `.dd64` x64dbg
-   database, a `.map`, and a `.symbols.json` with prototypes. Measured on F4VR: 60,615
-   functions, 60,671 x64dbg labels. Without it the analysis stays locked inside Ghidra.
-   `35-ghidra-analysis.ps1` runs it into `<bgs>\symbols\<game>-<ver>\`.
+   **The export is part of this step, not a later one.** `35-ghidra-analysis.ps1` runs
+   `scripts/core/symbol_export.py` itself (BGS menu 10 wraps the same code behind prompts) and
+   gates its own exit code on it: a run that analyzed but did not export exits **1**, not 2,
+   because "analyzed, no symbols" is a state that otherwise reads as success and strands Phase
+   5. It emits a `.dd64` x64dbg database, a `.map`, and a `.symbols.json` with prototypes;
+   without it the analysis stays locked inside Ghidra. Measured on F4VR (2026-08-16): 60,615
+   functions, 60,671 x64dbg labels.
+
+   **Where the symbols landed is recorded, not derivable.** Read `entries[].exportDir` in
+   `<bgs>\.analysis-verified.json` — the script prints it at the end of a run and
+   `40-x64dbg.ps1` reads it. Do not reconstruct that path by hand; this file used to state two
+   different wrong ones, and the directory on a machine that exported before the field existed
+   does not match today's layout either.
+
+   `-SkipExport` opts out. If an export goes missing later, **re-run this script — it does the
+   export alone, minutes rather than the hours menu 7 costs**, because the recorded analysis is
+   still good. That fast path exists so nobody reaches for `-Force` (a full re-analysis) to
+   recover a step measured in minutes.
 
    **The improvement drivers do nothing for F4VR** — measured, not assumed.
    `string_anchored_rename` renamed 0 (release build, no self-identifying debug strings),
@@ -159,9 +221,11 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    struct types, names **13** functions, and its own `>=100 named functions` check then rejects
    and rolls that apply back. Menu 9 fixes this without any extra binary — it re-applies the
    true-VR importer and then walks RTTI vtables **in the VR binary itself**. Measured on F4VR
-   1.2.72 with nothing else staged: 12,150 vtables discovered, **13 → 34,507 named functions**
-   of 216,903 (+34,494), and the changes are *saved*, not rolled back. `35-ghidra-analysis.ps1`
-   runs it automatically after option 7 (`-SkipImprove` opts out).
+   1.2.72 with nothing else staged: 12,150 vtables discovered, **13 → 34,507 named functions**,
+   and the changes are *saved*, not rolled back. (`35-ghidra-analysis.ps1`'s own comment at that
+   step carries the counts with their denominators; the denominator moves as analysis discovers
+   more functions, so do not compare it against the end-to-end table below.)
+   `35-ghidra-analysis.ps1` runs the pass automatically after option 7 (`-SkipImprove` opts out).
 
    **Which flat build you stage matters, and 1.11.221 is not the one for VR.** Measured here:
 
@@ -208,9 +272,16 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
        -Program /f4/vr/Fallout4VR.exe.unpacked.exe `
        -WriteMcpConfigTo <your-plugin-dir>
    ```
-   **No GUI and no clicks — run both yourself.** Measured on a clean machine: server
-   answering in ~5 s, 226 REST endpoints, and the bridge registers 225 MCP tools against it.
-   `-Status` and `-Stop` manage it; `-File <binary>` analyses a loose DLL/EXE with no project.
+   **No GUI and no clicks — run both yourself.** `36-ghidra-mcp.ps1`'s header carries the
+   measured bringup (endpoint and tool counts, with the Ghidra and ghidra-mcp versions they
+   were taken against) and its full flag list; `-Status` and `-Stop` manage the server.
+
+   **`30-ghidra.ps1` refuses (exit 2) while a JVM is running from that Ghidra install** —
+   including a pyghidra process, so this fires exactly when step 2 is still going. It is not a
+   flake and retrying will not clear it: `gradlew deploy`'s `stopGhidra` task would force-kill
+   an in-flight analysis and leave a stale project lock. Wait for step 2, or take the extension
+   jar without the GUI deploy with `-HeadlessOnly`, which the headless server does not need
+   anything from. Do not gate-loop on exit 0 here.
 
    **The build uses Gradle, not Maven.** `gradlew.bat` bootstraps itself and reads the Ghidra
    jars straight out of the install, so the JDK is the only prerequisite. This is not a
@@ -226,6 +297,12 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    toolset is broken.** (README also documents a `/server_status` endpoint for headless;
    `server_status` appears nowhere in the Java and returns 404.)
 
+   That pin is why **`-Port` has to be passed everywhere or nowhere.** It is what goes into
+   `GHIDRA_MCP_URL`, and discovery cannot correct a wrong one — a `.mcp.json` generated for one
+   port against a server listening on another is an agent session with no Ghidra tools in it
+   and nothing anywhere saying why. The PID and load records are per-port too, so `-Stop` on
+   the wrong port cannot find the server it is aimed at.
+
    Use the GUI path instead only when you want to *look* at the disassembly. Note that
    `patchGhidraUserConfig`, which makes the plugin auto-load, can only edit `FrontEndTool.xml`
    if it already exists — and it does not until the Ghidra GUI has run once. So on a fresh
@@ -233,20 +310,30 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    `30-ghidra.ps1`, and it will auto-start from then on.
 
 **Gate:** `36-ghidra-mcp.ps1 -Status` **exits 0** — which now means all three of a live
-connection, a non-zero tool count, and a loaded program, rather than just the connection. Then
-an MCP session can `decompile_function` and see **real names** rather than `FUN_*`.
+connection, a non-zero tool count, and a loaded program *whenever one was asked for*, rather
+than just the connection. That last qualifier is load-bearing: a bare `-Start`, and the
+locked-project path that deliberately starts with no project, both record that no program was
+requested, and `-Status` passes them. **So exit 0 is not by itself proof there is a program to
+decompile.** An agent that needs one must `-Stop` and `-Start -Program <path>`. Then an MCP
+session can `decompile_function` and see **real names** rather than `FUN_*`.
 **Read `docs/GHIDRA_WORKFLOW.md` before real RE work.**
 
 **Exit 2 from `-Start` means "up, but not what you asked for" — read it, don't retry it.** The
 server is running and serving its full toolset; something about the *requested* state does not
-hold. Three ways to get it, and each wants a different response:
+hold. Four ways to get it, and each wants a different response:
 
 - **The project was locked**, so your `-Program` was dropped and the server came up empty. The
   holder is named in the output. Wait for it, or work against the loaded-nothing server. Never
   delete a lock that is held.
+- **The `-Program` you named failed to load** — a path that is not in the project, or a
+  `LockException`. Ghidra prints the failure and carries on, so the server is healthy and empty
+  and every tool call answers "No program loaded". Check the path against the layout the
+  pipeline imported into (`/f4/vr/Fallout4VR.exe.unpacked.exe`), not against the filesystem.
 - **A different program is loaded** than the one you named. `-Stop` first, then `-Start` again.
 - **The `.mcp.json` already there points somewhere else** — a different port or a different
-  bridge. The difference is printed; reconcile it, or point `-WriteMcpConfigTo` elsewhere.
+  bridge. The difference is printed. Reconcile it, point `-WriteMcpConfigTo` elsewhere, or pass
+  `-Force`, which **regenerates** that file from this pack's two servers rather than merging:
+  any other MCP server you had added to it is gone.
 
 A caller that gates on `-eq 0` treats 1 and 2 alike and is right to. Only ask which it was when
 you need "it is up, just not loaded" to be actionable. Either way the JVM is running and still
@@ -282,9 +369,10 @@ bulk of these names come from the VR address-library import, which sets names on
 arguments and **27,813 of those are 1-byte stubs** — `NiPointer`, `BSTSmartPointer`, `CArgs`
 and `StreamRequest` included. Applying a 1-byte stub to a parameter is worse than leaving it
 `undefined`: the decompiler then reports field offsets that are confidently wrong. Bare leaf
-names are worse still — **four unrelated types in this program are called `Entry`**. Measured
-across all 25,867 signature-carrying functions, argument types resolve as
-**14,194 exact + 10,443 builtin, against 22,670 unresolved.**
+names are worse still — **four unrelated types in this program are called `Entry`**. The
+resolution table — measured across all 25,867 signature-carrying functions, and split by match
+kind so the `RE::`-normalised row is not miscounted as unresolved — is in
+`ghidra-scripts/README.md`; it belongs next to the resolver that produced it.
 
 So the honest ceiling on "make the decompiles typed" is roughly half the parameters. The
 unresolved half clusters tightly — Havok (`hkbInternal`, `hkQsTransformf`, `hkaSkeleton`) and
@@ -298,8 +386,8 @@ A Ghidra project is single-writer. If the enrichment pipeline (or a GUI, or anot
 holds the lock, `36-ghidra-mcp.ps1` says who has it and starts with no project rather than
 failing deep inside Ghidra. **Never delete a `.lock` while its holder is alive.**
 
-Bonus once analysis is done: BGS menu option 10 exports symbols for **x64dbg** (live
-debugging with real names) and can build a synthetic PDB.
+BGS menu option 10 wraps the same `symbol_export.py` step 2 already ran, and can also build a
+synthetic PDB. You do not need it for Phase 5 — this pack's path is 35's own export.
 
 ## Phase 5 — x64dbg + MCP (live debugging)
 
@@ -307,22 +395,38 @@ debugging with real names) and can build a synthetic PDB.
 .\setup\40-x64dbg.ps1
 ```
 
-Verified on a clean machine: pulls the x64dbg snapshot and installs the pinned MCP plugin into
-both `x64\plugins\x64dbg_mcp.dp64` and `x32\plugins\x64dbg_mcp.dp32`. Runs unattended.
+Runs unattended, and does one of two different things depending on what is already at
+`-InstallDir`. On a machine with no x64dbg it installs a **pack-managed** one: the snapshot,
+then the pinned MCP plugin into both `x64\plugins\x64dbg_mcp.dp64` and
+`x32\plugins\x64dbg_mcp.dp32`. Against an x64dbg that was already there it **adopts** it —
+fetches no snapshot, flattens nothing, and writes only those two plugin files, because that
+directory holds the user's settings, databases and other plugins.
 
-**Load the symbols Phase 4 exported — that is the entire point.** `35-ghidra-analysis.ps1`
-writes `<bgs>\symbols\<game>\<Game>.dd64`, an x64dbg database in exactly x64dbg's own format
-(`{"labels":[{module,address,manual,text}]}`, RVAs against `fallout4vr.exe`). Measured on F4VR:
-**60,671 labels**, carrying real C++ signatures like
-`BGSAIWorldLocation::LoadLocation(BGSLoadFormBuffer*)` rather than `sub_1250`. Without it
-you are debugging raw addresses. Note the file is plain JSON, not gzipped — x64dbg reads both.
+What decides which is `<InstallDir>\.starter-pack-install.json`, the receipt the script writes
+after watching an install finish. It is also the only record of **which** MCP release the
+`.dp64` came from, since every release ships that file under the same name — so deleting the
+receipt is the way to force the plugin to be fetched again after a pin bump. Deleting it does
+not re-fetch the x64dbg snapshot.
+
+**Load the symbols Phase 4 exported — that is the entire point.** They are a `.dd64` in exactly
+x64dbg's own format (`{"labels":[{module,address,manual,text}]}`, RVAs against
+`fallout4vr.exe`); measured on F4VR (2026-08-16), **60,671 labels** carrying real C++ signatures
+like `BGSAIWorldLocation::LoadLocation(BGSLoadFormBuffer*)` rather than `sub_1250`. Without
+them you are debugging raw addresses. The file is plain JSON, not gzipped — x64dbg reads both.
+`40-x64dbg.ps1` finds them itself, by reading `exportDir` out of `.analysis-verified.json` and
+falling back to `<BgsRoot>\symbols`, and it prints which of the two it used. If your repos are
+not under `C:\repos`, pass `-BgsRoot`/`-Root` rather than believing "run 35 first" over a
+finished Phase 4.
 
 **Never probe the npm server with `--version` or `--help`.** It ignores them, starts the stdio
 MCP server, and logs `Timeout: none (waits indefinitely)` — the call hangs until something
-kills it. Confirm the pin from `mcp/mcp.template.json` instead; a successful start prints
+kills it. The pin has one home — `$script:X64dbgMcpServerPin` in `setup\_common.ps1`, which
+both the release tag `40-x64dbg.ps1` fetches and the npm spec written into `.mcp.json` derive
+from — so read it there rather than from any generated file. A successful start prints
 `[x64dbg-mcp] Server started (23 tools), plugin expected at 127.0.0.1:27042`.
 
-**Gate:** launching `C:\tools\x64dbg\x96dbg.exe` → x64 → log shows
+**Gate:** launching `x96dbg.exe` from the `-InstallDir` you used (default `C:\tools\x64dbg`;
+the script prints the real path) → x64 → log shows
 `[MCP] x64dbg MCP Server started on 127.0.0.1:27042`. For MO2-managed games: launch the game
 through MO2 first, then **attach** x64dbg to the process. (This last step needs the game, so
 it is the one part of Phase 5 an agent cannot self-verify.)
@@ -359,9 +463,11 @@ Launch **through MO2**, never from Steam: the mods only exist inside MO2's virtu
 so a Steam launch is silently vanilla. MO2 executable titles must not contain spaces —
 `moshortcut://` arguments get whitespace-split by callers.
 
-Verified live on FO4VR 1.2.72 (2026-08-16): all 7 tools answer; `rendertarget list` returns
-95 targets at 3024x1680 R11G11B10_FLOAT; `measure` reports 135 fps / p99 18.2 ms. See
-`docs/DEVBENCH.md` for the full table. Two things that cost real time to learn:
+Verified live on FO4VR 1.2.72 (2026-08-16): every tool in the catalogue answered;
+`rendertarget list` returns 95 targets at 3024x1680 R11G11B10_FLOAT; `measure` reports 135 fps
+/ p99 18.2 ms. The catalogue has grown since — devbench added a Fallout `menu` tool on
+2026-08-17 — so take the current list from `docs/DEVBENCH.md`, not from that run. Two things
+that cost real time to learn:
 
 - **The server binds at `kPostLoad`, not `kGameDataReady`.** On F4SEVR that message arrives
   ~7 s late and on some installs never — a server bound to it never starts at all.
@@ -375,10 +481,12 @@ Verified live on FO4VR 1.2.72 (2026-08-16): all 7 tools answer; `rendertarget li
 .\setup\90-verify.ps1 -BuildTest
 ```
 
-No `FAIL` row = the machine is at parity. `FAIL` is the only state that gates the exit code;
-the other four are information, not alarm:
+No `FAIL` row = the machine is at parity. Every row is `Area` / `Check` / `OK` / `Detail` —
+those four field names are the machine-readable contract, and `OK` carries the state, not a
+boolean. `FAIL` is the only state that gates the exit code; the other four are information,
+not alarm:
 
-| | |
+| `OK` | |
 |---|---|
 | `PASS` | checked, and it held |
 | `FAIL` | checked, and it did not — the only state that exits 1 |
@@ -391,7 +499,8 @@ was found, which JVM `gradlew` will use, which jar is missing — not a restatem
 
 `-Json` emits the same rows as a JSON array, which is what an agent should consume; a
 `Format-Table` render moves its column boundaries with the terminal width. `-Fast` drops the
-delegated `-CheckOnly` gate rows, the only ones that spawn a process.
+delegated `-CheckOnly` gate rows, the only rows that spawn a process rather than reading state.
+(`-BuildTest` spawns three of its own — that is the point of it, and it is opt-in.)
 
 ## Standing rules for work in this environment
 
@@ -408,6 +517,17 @@ delegated `-CheckOnly` gate rows, the only ones that spawn a process.
   silently coerced (see `docs/DEVBENCH.md` for why this rule exists).
 - Prefer building against the pinned/vendored versions in this pack; upgrade deliberately,
   one component at a time, with the verifier run after.
+- **A change to the setup scripts must keep `tests\run-all.ps1` green.** Its three fixtures pin
+  fixes whose failure mode destroys something the user cannot get back — an unrelated process
+  force-killed, a directory of local work deleted, hours of build state declared ready when it
+  is not — so a red there is never cosmetic. CI runs it (`ps-compat.yml`, the `contract-tests`
+  job) alongside the 5.1 parse and BOM lints, an end-to-end scaffold+build on two runner images
+  (`e2e-build.yml`), the Phase 4 bringup (`ghidra-bringup.yml`) and the same bringup against
+  Ghidra's latest release (`ghidra-drift.yml`).
+- **When you change a script, grep the docs for what it used to claim.** The script header owns
+  its own flags, sizes, paths and exit codes; this file and the READMEs own the sequence, the
+  gates, the traps and dated measurements. Anything restated in both places drifts, and the doc
+  is the copy that loses.
 - **Never destroy what you cannot prove you created.** Before any `Remove-Item -Recurse`,
   `Stop-Process`, or `Move-Item -Force` against something a user could own, the script must hold
   local evidence that the pack made it: a pre-existence flag captured before the operation, an

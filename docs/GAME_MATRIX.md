@@ -16,8 +16,11 @@ game; the pack's defaults are **bold**.
   lib. alandtse's fork dispatches at runtime: `ENABLE_FALLOUT_F4`/`_NG`/`_VR` default ON and
   `REL::Module::IsVR()`/`IsNG()`/`IsF4()` decide at load time, so there is no `FALLOUTVR`
   compile-time define. The template's `windows-vcpkg-vr` preset sets `BUILD_FALLOUTVR=ON`,
-  which only selects the deploy target and `buildvr/`; `windows-vcpkg` sets it OFF for
-  `build/`. Gate runtime-specific code on `REL::Module`, never on a macro. VR/NG-specific
+  which selects `buildvr/` and *which* install a deploy would target (`FalloutVRPath` rather
+  than `Fallout4Path`) — it does not by itself deploy anything, and neither preset asks for a
+  deploy, so a plain build leaves the DLL in its build directory (the two deploy mechanisms,
+  and the checks on them, are in `../CLAUDE.md`). `windows-vcpkg` sets `BUILD_FALLOUTVR` OFF
+  for `build/`. Gate runtime-specific code on `REL::Module`, never on a macro. VR/NG-specific
   structs are still early-stage; verify offsets against the actual binary before trusting a
   struct layout.
 - **F4VR never updates.** Runtime is 1.2.72 forever, which is why RE work there ages well.
