@@ -120,6 +120,27 @@ chooses which install a deploy *would* target; the hidden `vr`/`flat` presets th
 choose the build directory (`buildvr/` vs `build/`). Gate your own runtime-specific code on
 `REL::Module::IsVR()` / `IsNG()` / `IsF4()`, not on a compile-time macro.
 
+**One DLL, but TWO plugin handshakes — and flat Fallout 4 no longer speaks the old one.**
+F4SE 0.7.0 replaced `F4SEPlugin_Query` with a declarative `F4SEPlugin_Version` record, and by
+0.7.9 (the build for Fallout 4 1.11.240) the old entry point is simply gone: the string
+`F4SEPlugin_Query` does not occur anywhere in `f4se_1_11_240.dll`. F4SEVR 1.2.72 is the mirror
+image — it resolves `Query` and `Load` and has never heard of `F4SEPlugin_Version`. So the
+template exports **both**, and each extender ignores the one it does not look for. Export only
+`Query` and the plugin is refused before a line of its code runs, with the one log line that
+says so and nothing else:
+
+```
+plugin <name>.dll (00000000  00000000) no version data 0 (handle 0)
+```
+
+The record sets `addressIndependence` and `structureIndependence` to `(1<<1)|(1<<2)` directly
+rather than calling `UsesAddressLibrary()`, because CommonLibF4's helper hardcodes `1<<1` —
+the 1.10.980-era address library — and a plugin offering only that bit is not claiming the
+Anniversary (1.11.137+) library a 1.11 runtime wants. `compatibleVersions` is left empty,
+meaning "any runtime", which is right for an address-library plugin; if yours reads struct
+**fields** you have only verified on one build, pin them with `CompatibleVersions({...})` and
+let F4SE refuse you elsewhere instead of reading garbage.
+
 **Neither default preset deploys anything.** `COPY_BUILD` is FALSE unless you ask for it, and
 `windows-vcpkg-vr` / `windows-vcpkg` do not ask — a plain build leaves the DLL in its build
 directory and copies it nowhere. Deploying is a separate decision with two mechanisms:

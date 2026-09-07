@@ -49,6 +49,43 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a
 	return true;
 }
 
+// F4SE 0.7.0 replaced the Query/Load handshake with a declarative version record, and by
+// 0.7.9 -- the build for Fallout 4 1.11.240 -- the old one is GONE: the string
+// "F4SEPlugin_Query" does not occur anywhere in f4se_1_11_240.dll. F4SEVR 1.2.72 is the
+// mirror image: it resolves Query and Load and has never heard of F4SEPlugin_Version.
+// ONE DLL SERVES BOTH GAMES, so it exports BOTH handshakes and each extender ignores the
+// one it does not look for. Export only Query and flat Fallout 4 rejects the plugin before
+// a line of its code runs, logging the line f4se.log shows for any versionless DLL:
+//     plugin <name>.dll (00000000  00000000) no version data 0 (handle 0)
+extern "C" DLLEXPORT constinit auto F4SEPlugin_Version = []() noexcept {
+	F4SE::PluginVersionData data{};
+
+	data.PluginVersion(REL::Version{ static_cast<std::uint16_t>(Version::MAJOR),
+		static_cast<std::uint16_t>(Version::MINOR),
+		static_cast<std::uint16_t>(Version::PATCH), 0 });
+	data.PluginName(Version::PROJECT);
+
+	// Set these bits directly rather than through UsesAddressLibrary()/IsLayoutDependent().
+	// Those helpers hardcode 1 << 1 -- the 1.10.980-era address library -- and a plugin that
+	// offers only that bit is not claiming the Anniversary (1.11.137+) library this runtime
+	// actually wants.
+	//   1 << 1 = address library / struct layout for the 1.10.980 family (Next-Gen)
+	//   1 << 2 = address library / struct layout for the 1.11.137 family (Anniversary)
+	// Declaring both is what a CommonLibF4 plugin IS: every offset it resolves goes through
+	// Data\F4SE\Plugins\version-<runtime>.bin, and CommonLibF4 picks that filename from the
+	// version of the binary that actually loaded it -- see REL/IDDB.cpp.
+	data.addressIndependence = (1u << 1) | (1u << 2);
+	data.structureIndependence = (1u << 1) | (1u << 2);
+
+	// compatibleVersions is deliberately left empty, which means "any runtime". That is the
+	// right default for an address-library plugin. If yours reaches into struct FIELDS you
+	// have only verified on one build, pin them instead:
+	//     data.CompatibleVersions({ F4SE::RUNTIME_1_11_240 });
+	// and F4SE refuses to load you anywhere else, rather than letting you read garbage.
+
+	return data;
+}();
+
 extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f4se)
 {
 	InitializeLog();
