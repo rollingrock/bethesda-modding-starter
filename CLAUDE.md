@@ -198,8 +198,17 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    **Use run.py's subcommands, not the menu** — and this script already does. `python run.py
    setup` (menu 1+2), `build` (menu 7), `all` and `clean` are documented under "Non-interactive
    mode" and need no stdin at all; only the improve pass (menu 9) has no subcommand, and it is
-   the one place `35-ghidra-analysis.ps1` still feeds menu keys. `run clean` before rebuilding
-   if the project records a different importer stage, or stale names survive.
+   the one place `35-ghidra-analysis.ps1` still feeds menu keys.
+
+   **`run clean` deletes the whole project — ask the operator first.** It is the one destructive
+   action in this phase that no code gate can catch, because it is a doc instruction rather than
+   a script path: `run.py`'s `clean_project` `_safe_rmtree`s the entire Ghidra project directory
+   and unlinks the state file. That is every hour of analysis for every binary in it, with no
+   undo and no backup. Worse afterwards: `.analysis-verified.json` still says analyzed, so the
+   next `35` run takes the export-only fast path, finds no project, and tells you to spend the
+   hours again. It is occasionally the right call — a project that records a different importer
+   stage, or where stale names survive a re-apply — but it is never the cheap first move, and an
+   agent must not reach for it unprompted.
 
    **The export is part of this step, not a later one.** `35-ghidra-analysis.ps1` runs
    `scripts/core/symbol_export.py` itself (BGS menu 10 wraps the same code behind prompts) and
@@ -227,10 +236,7 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    byte-identical before and after all five. They are documented as being for "where CommonLib
    is thin (newer builds, Starfield, FNV)" — F4VR's gap is a *naming-source* gap, not a type
    gap. Worth trying on Starfield; do not spend time on them for Fallout 4 VR.
-   Their multi-program runner `discover_combined.py` is also broken on Windows: it calls
-   `getExecutablePath()` raw instead of the `_program_executable_path()` normalizer that sits
-   beside it, so Ghidra's `/C:/...` form becomes `C:\C:\...` and every program fails identity
-   verification. `apply_enrichment_to_user_project.py` (one driver, one program) is correct.
+   `apply_enrichment_to_user_project.py` (one driver, one program) is the correct entry point.
 
    Option 7's auto-analysis takes **hours per binary** — start it detached (or overnight) and
    do not interrupt it. Scope with `-OnlyGame <skyrim|f4|starfield|fnv>`; the other staged
@@ -256,31 +262,36 @@ readable), then the **MCP bridge** so you can drive Ghidra from sessions.
    | `+ f4\221` | 221 itself: **31,040 scoped `Class::Fn`** names. VR: **no change** |
 
    The auto-run porter (`run_bytesig_port.py`) anchors only at AE or NG — literally
-   `for cand in ("ae", "ng")` — so a 221 binary never triggers it. Forcing the other porter
-   (`bytesig_port_combined.py --source 221`, which BGS documents as "the richest PDB pool")
-   ported **1 function out of 12,240**: exact 32-byte pass matched once, the masked 48-byte
-   retry matched nothing. 1.11.221 and VR 1.2.72 are too far apart to share function bodies.
-   BGS ships vtable-slot shift maps for `vr_to_ae` and `vr_to_ng` and none for 221, which is
-   the same conclusion from the other direction.
+   `for cand in ("ae", "ng")` — so a 221 binary never triggers it, and forcing a 221-sourced
+   port moved **1 function out of 12,240**. 1.11.221 and VR 1.2.72 are too far apart to share
+   function bodies. BGS ships vtable-slot shift maps for `vr_to_ae` and `vr_to_ng` and none for
+   221, which is the same conclusion from the other direction.
 
-   So: stage **`exes\f4\ae\Fallout4.exe` (1.11.191)** or **`\ng\` (1.10.984)** if you want real
-   CommonLib names on VR. `exes\f4\221\` is still worth staging — it is what unlocks the
-   38k-record PDB-publics corpus and it names the flat binary well — but it does nothing for
-   VR. Without an AE/NG binary the RTTI walk's ~34.5k is the realistic ceiling for F4VR.
+   **Stage the build you actually have.** Retail flat Fallout 4 is **1.11.240** and has been
+   since 2026-08-19, so `exes\f4\240\Fallout4.exe` is the only flat binary most people can
+   produce — the 1.11.191 (`ae`) and 1.10.984 (`ng`) builds in the table above are not
+   purchasable, only kept. BGS v1.2.2 ships a 1.11.240 corpus and a `CommonLibImport_F4_240.py`
+   for exactly this: measured here 2026-09-07, staging `f4\240` alone gave **46,882 named
+   functions** after the improve pass, on the binary the game actually runs.
 
-   Two traps that make the corpus look absent when it is not:
+   Two things follow. The version directory name is what selects the importer — `run.py`'s
+   `_infer_commonlib_script` reads the *filename*, so stage as `Fallout4_1_11_240.exe` and it
+   resolves unambiguously; a bare `Fallout4.exe` in an `ae\` directory does not, and a 1.11.240
+   binary under `ae\` fails identity outright with `executable version (1, 11, 240, 0) !=
+   expected (1, 11, 191, 0)`. And the VR story is unchanged: 240 does nothing for F4VR either,
+   so without an AE/NG binary the RTTI walk's ~34.5k remains the realistic ceiling there.
+
+   One trap that makes the corpus look absent when it is not:
    - **`PDB publics: 0 loaded`** — the corpus is identity-bound by SHA-256 to one exact
      `Fallout4.exe`. It is skipped silently unless that binary is staged.
-   - **Git mangles the corpus on Windows.** `f4_221_pdb_publics.txt` is a byte-exact artifact
-     with no `.gitattributes` protection, so `core.autocrlf=true` (the Git-for-Windows default)
-     rewrites its line endings on checkout and its hash stops matching — the validator then
-     raises `ValueError: F4 221 PDB-public dump changed after binding` and kills the whole run
-     with a traceback. Fix by converting it back to LF (3,939,250 → 3,901,215 bytes, sha256
-     `ab927b7d…`) and pinning it with `-text` in `.git/info/attributes`.
-   - **clang is resolved as a bare `clang` on PATH**, but BGS installs it to `tools\llvm\bin`.
-     Menu 1 mutates PATH only inside its own process, so every later run prints
-     `Clang: not installed` and **silently skips script generation** — the run then imports
-     binaries and ports nothing, with no error. `35-ghidra-analysis.ps1` puts it on PATH.
+
+   **Do not hand-edit the corpus line endings.** BGS v1.2.2 ships a tracked `.gitattributes`
+   pinning both PDB corpora and both bytesig CSVs `-text`, so a fresh clone gets them
+   byte-exact and there is nothing to repair. This used to be a real trap and the old fix was
+   to rewrite the file to LF by hand — do not do that now. Rewriting a byte-exact artifact is
+   how you *cause* `ValueError: F4 221 PDB-public dump changed after binding`, not how you fix
+   it. If you ever do see that error, verify the file's sha256 against its sibling
+   `*.identity.json` and restore from git; never normalize it.
 
    **Do not treat the `.gpr` as proof of success.** Ghidra creates the project and imports the
    binary *before* enrichment runs, and `run.py` exits 0 even when verification fails and rolls
