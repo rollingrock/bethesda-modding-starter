@@ -108,7 +108,32 @@ $repos = @(
     # branch handed a fresh machine the broken build while the docs said Phase 6 worked.
     @{ Name = 'devbench';     Url = 'https://github.com/rollingrock/devbench.git';      Args = @('--recurse-submodules') }
     @{ Name = 'ghidra-mcp';   Url = 'https://github.com/bethington/ghidra-mcp.git';     Args = @() }
-    @{ Name = 'BethesdaGhidraScripts'; Url = 'https://github.com/1001Bits/BethesdaGhidraScripts.git'; Args = @() }
+    # BethesdaGhidraScripts: the ROLLINGROCK FORK on a fix branch, not 1001Bits upstream, and
+    # only because upstream v1.2.2 cannot analyze a current Fallout 4. That release added the
+    # 1.11.240 PDB corpus -- 42,636 public symbols, the thing that makes an Anniversary
+    # decompile readable -- but scripts\commonlibf4\refs\f4_240_pdb_publics.txt.identity.json
+    # lists ONE target, the packed retail exe. The pipeline does not validate against that one:
+    # parse_commonlib_types.py binds to the fresh Steamless artifact whenever one exists, which
+    # on a Steam copy it always does, because run.py has just made it. So the sha handed to
+    # pdb_publics_f4_240.py is the unpacked binary's, it is not in the allowed set, and menu 7
+    # dies minutes into a job this pack's own docs call "hours, do not interrupt":
+    #     ValueError: F4 240 PDB-public dump targets another executable
+    # Wider than Fallout, too: that raise is inside a check=True subprocess in generate_scripts(),
+    # so the same traceback takes down the byte-sig port, the true-F4VR importer AND
+    # Starfield/FNV generation in one pass. Only Skyrim survives, being emitted first. The
+    # sibling f4_221 sidecar lists BOTH packed and unpacked targets, which is what makes this a
+    # v1.2.2 regression rather than policy.
+    #
+    # Pinned to the branch rather than the fork's default: this is one specific fix, and a
+    # fork's main is not a promise. Upstream is where it belongs -- but PR #1 to 1001Bits was
+    # closed unmerged, so upstream responsiveness is unproven and a fresh machine cannot wait on
+    # it. When it lands there, restore the 1001Bits URL and drop the -b.
+    #
+    # Cost of the switch, so it is not a surprise on an EXISTING machine: Test-RepoIdentity
+    # compares origin URL, so a clone that came from 1001Bits now reports exit 2 "different
+    # repository" and is left exactly where it is. That is the provenance rule working as
+    # designed -- nothing is cloned over -- but it is a message to read, not a fault to fix.
+    @{ Name = 'BethesdaGhidraScripts'; Url = 'https://github.com/rollingrock/BethesdaGhidraScripts.git'; Args = @('-b', 'fix/f4-240-unpacked-target') }
     # modlist-agent: builds the MO2 instance Phase 6 runs against, and ships
     # core/tools/steamvr-null.ps1 -- the SteamVR null driver toggle that lets a VR game boot
     # and load its plugins with no headset attached. That is what makes Phase 6 something an
