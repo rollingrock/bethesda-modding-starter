@@ -78,10 +78,17 @@ extern "C" DLLEXPORT constinit auto F4SEPlugin_Version = []() noexcept {
 	data.structureIndependence = (1u << 1) | (1u << 2);
 
 	// compatibleVersions is deliberately left empty, which means "any runtime". That is the
-	// right default for an address-library plugin. If yours reaches into struct FIELDS you
-	// have only verified on one build, pin them instead:
-	//     data.CompatibleVersions({ F4SE::RUNTIME_1_11_240 });
-	// and F4SE refuses to load you anywhere else, rather than letting you read garbage.
+	// right default for an address-library plugin: the ids resolve to whatever the installed
+	// database says, so a new game build works without rebuilding you.
+	//
+	// If yours reaches into struct FIELDS you have only verified on one build, pin them
+	// instead, and F4SE refuses to load you anywhere else rather than letting you read
+	// garbage. Construct the version rather than naming a constant --
+	//
+	//     data.CompatibleVersions({ REL::Version{ 1, 11, 240, 0 } });
+	//
+	// because CommonLibF4's F4SE::RUNTIME_* constants stop at RUNTIME_1_10_984 and there is
+	// no RUNTIME_1_11_240 to name. That gap is the same one behind the two bits set above.
 
 	return data;
 }();
