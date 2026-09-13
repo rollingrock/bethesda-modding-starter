@@ -418,7 +418,14 @@ instance-mode MO2 keeps it under %LOCALAPPDATA%\ModOrganizer\<game>\mods).
         Write-Host 'That sets BUILD_FALLOUTVR=OFF, so it builds into build/ rather than buildvr/ and aims a'
         Write-Host 'deploy, if you ever enable one, at the flat install -- neither preset deploys by itself.'
         Write-Host 'The DLL is identical either way: CommonLibF4 picks the runtime at load time, so one build'
-        Write-Host 'already works on F4, NG and VR.'
+        Write-Host 'serves pre-Next-Gen Fallout 4, Next-Gen 1.10.984 and Fallout 4 VR 1.2.72.'
+        Write-Host ''
+        Write-Host 'It does NOT follow that it serves the CURRENT retail build. Fallout 4 1.11.x uses a'
+        Write-Host 'different address-library id namespace from 1.10.x, and this template''s CommonLibF4'
+        Write-Host 'tops out at RUNTIME_LATEST = 1.10.984. Ids that exist only on 1.10.x resolve to a'
+        Write-Host 'NEIGHBOURING symbol there rather than failing, so the failure is silent. Before you'
+        Write-Host 'trust anything this plugin reads on 1.11.x, resolve its ids against that runtime''s'
+        Write-Host 'version-1-11-*.bin -- see docs\GAME_MATRIX.md.'
     }
 }
 elseif ($Game -eq 'SF') {
